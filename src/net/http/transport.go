@@ -540,6 +540,48 @@ func (t *Transport) CloseIdleConnections() {
 	}
 }
 
+var errCloseConn = errors.New("http: CloseConnection called")
+
+// CloseConnections closes any connections which were previously
+// connected from previous requests. It may interrupt connections
+// currently in use.
+func (t *Transport) CloseConnection(f func(raddr net.Addr) bool) {
+	t.nextProtoOnce.Do(t.onceSetNextProtoDefaults)
+	t.idleMu.Lock()
+	m := t.idleConn
+	t.idleConn = nil
+	t.idleConnCh = nil
+	t.wantIdle = true
+	t.idleLRU = connLRU{}
+	t.idleMu.Unlock()
+	for _, conns := range m {
+		for _, pconn := range conns {
+			if f(pconn.conn.RemoteAddr()) {
+				pconn.close(errCloseConn)
+			}
+		}
+	}
+	if t2 := t.h2transport; t2 != nil {
+		if p, ok := t2.connPool().(*http2clientConnPool); ok {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+
+			for _, vv := range p.conns {
+				for _, cc := range vv {
+					cc.mu.Lock()
+					if f(cc.tconn.RemoteAddr()) {
+						cc.closed = true
+					}
+					cc.mu.Unlock()
+					if cc.closed {
+						cc.tconn.Close()
+					}
+				}
+			}
+		}
+	}
+}
+
 // CancelRequest cancels an in-flight request by closing its connection.
 // CancelRequest should only be called after RoundTrip has returned.
 //
