@@ -97,6 +97,9 @@ type Transport struct {
 	// If Proxy is nil or returns a nil *URL, no proxy is used.
 	Proxy func(*Request) (*url.URL, error)
 
+	// GetConnectMethodAddr specifies a function to return a addr string for ConnectMethod
+	GetConnectMethodAddr func(addr string) string
+
 	// DialContext specifies the dial function for creating unencrypted TCP connections.
 	// If DialContext is nil (and the deprecated Dial below is also nil),
 	// then the transport dials using package net.
@@ -652,6 +655,7 @@ func (t *Transport) connectMethodForRequest(treq *transportRequest) (cm connectM
 	if port := treq.URL.Port(); !validPort(port) {
 		return cm, fmt.Errorf("invalid URL port %q", port)
 	}
+	cm.GetConnectMethodAddr = t.GetConnectMethodAddr
 	cm.targetScheme = treq.URL.Scheme
 	cm.targetAddr = canonicalAddr(treq.URL)
 	if t.Proxy != nil {
@@ -1363,11 +1367,16 @@ type connectMethod struct {
 	// then targetAddr is not included in the connect method key, because the socket can
 	// be reused for different targetAddr values.
 	targetAddr string
+
+	GetConnectMethodAddr func(addr string) string
 }
 
 func (cm *connectMethod) key() connectMethodKey {
 	proxyStr := ""
 	targetAddr := cm.targetAddr
+	if cm.GetConnectMethodAddr != nil {
+		targetAddr = cm.GetConnectMethodAddr(targetAddr)
+	}
 	if cm.proxyURL != nil {
 		proxyStr = cm.proxyURL.String()
 		if (cm.proxyURL.Scheme == "http" || cm.proxyURL.Scheme == "https") && cm.targetScheme == "http" {
