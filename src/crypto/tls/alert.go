@@ -16,6 +16,7 @@ const (
 
 const (
 	alertCloseNotify            alert = 0
+	alertEndOfEarlyData         alert = 1
 	alertUnexpectedMessage      alert = 10
 	alertBadRecordMAC           alert = 20
 	alertDecryptionFailed       alert = 21
@@ -39,6 +40,7 @@ const (
 	alertUserCanceled           alert = 90
 	alertNoRenegotiation        alert = 100
 	alertNoApplicationProtocol  alert = 120
+	alertSuccess                alert = 255 // dummy value returned by unmarshal functions
 )
 
 var alertText = map[alert]string{

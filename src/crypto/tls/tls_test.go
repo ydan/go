@@ -9,7 +9,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"internal/testenv"
 	"io"
 	"io/ioutil"
 	"math"
@@ -331,8 +330,6 @@ func TestTLSUniqueMatches(t *testing.T) {
 }
 
 func TestVerifyHostname(t *testing.T) {
-	testenv.MustHaveExternalNetwork(t)
-
 	c, err := Dial("tcp", "www.google.com:https", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -357,8 +354,6 @@ func TestVerifyHostname(t *testing.T) {
 }
 
 func TestVerifyHostnameResumed(t *testing.T) {
-	testenv.MustHaveExternalNetwork(t)
-
 	config := &Config{
 		ClientSessionCache: NewLRUClientSessionCache(32),
 	}
@@ -646,18 +641,23 @@ func TestCloneNonFuncFields(t *testing.T) {
 			f.Set(reflect.ValueOf("b"))
 		case "ClientAuth":
 			f.Set(reflect.ValueOf(VerifyClientCertIfGiven))
-		case "InsecureSkipVerify", "SessionTicketsDisabled", "DynamicRecordSizingDisabled", "PreferServerCipherSuites":
+		case "InsecureSkipVerify", "SessionTicketsDisabled", "DynamicRecordSizingDisabled", "PreferServerCipherSuites", "Accept0RTTData":
 			f.Set(reflect.ValueOf(true))
 		case "MinVersion", "MaxVersion":
 			f.Set(reflect.ValueOf(uint16(VersionTLS12)))
 		case "SessionTicketKey":
 			f.Set(reflect.ValueOf([32]byte{}))
 		case "CipherSuites":
+		case "TLS13CipherSuites":
 			f.Set(reflect.ValueOf([]uint16{1, 2}))
 		case "CurvePreferences":
 			f.Set(reflect.ValueOf([]CurveID{CurveP256}))
 		case "Renegotiation":
 			f.Set(reflect.ValueOf(RenegotiateOnceAsClient))
+		case "Max0RTTDataSize":
+			f.Set(reflect.ValueOf(uint32(0)))
+		case "SessionTicketSealer":
+			// TODO
 		default:
 			t.Errorf("all fields must be accounted for, but saw unknown field %q", fn)
 		}

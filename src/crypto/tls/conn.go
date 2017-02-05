@@ -27,18 +27,22 @@ type Conn struct {
 	conn     net.Conn
 	isClient bool
 
+	phase handshakeStatus // protected by in.Mutex
+	// handshakeConfirmed is an atomic bool for phase == handshakeConfirmed
+	handshakeConfirmed int32
+	// confirmMutex is held by any read operation before handshakeConfirmed
+	confirmMutex sync.Mutex
+
 	// constant after handshake; protected by handshakeMutex
 	handshakeMutex sync.Mutex // handshakeMutex < in.Mutex, out.Mutex, errMutex
-	// handshakeCond, if not nil, indicates that a goroutine is committed
-	// to running the handshake for this Conn. Other goroutines that need
-	// to wait for the handshake can wait on this, under handshakeMutex.
-	handshakeCond *sync.Cond
-	handshakeErr  error   // error resulting from handshake
-	vers          uint16  // TLS version
-	haveVers      bool    // version has been negotiated
-	config        *Config // configuration passed to constructor
-	// handshakeComplete is true if the connection is currently transferring
-	// application data (i.e. is not currently processing a handshake).
+	handshakeErr   error      // error resulting from handshake
+	connID         []byte     // Random connection id
+	clientHello    []byte     // ClientHello packet contents
+	vers           uint16     // TLS version
+	haveVers       bool       // version has been negotiated
+	config         *Config    // configuration passed to constructor
+	// handshakeComplete is true if the connection reached application data
+	// and it's equivalent to phase > handshakeRunning
 	handshakeComplete bool
 	// handshakes counts the number of handshakes performed on the
 	// connection so far. If renegotiation is disabled then this is either
@@ -81,6 +85,10 @@ type Conn struct {
 	clientProtocol         string
 	clientProtocolFallback bool
 
+	// ticketMaxEarlyData is the maximum bytes of 0-RTT application data
+	// that the client is allowed to send on the ticket it used.
+	ticketMaxEarlyData int64
+
 	// input/output
 	in, out   halfConn     // in.Mutex < out.Mutex
 	rawInput  *block       // raw input, right off the wire
@@ -99,8 +107,32 @@ type Conn struct {
 	// in Conn.Write.
 	activeCall int32
 
+	// TLS 1.3 needs the server state until it reaches the Client Finished
+	hs *serverHandshakeState
+
+	// earlyDataBytes is the number of bytes of early data received so
+	// far. Tracked to enforce max_early_data_size.
+	// We don't keep track of rejected 0-RTT data since there's no need
+	// to ever buffer it. in.Mutex.
+	earlyDataBytes int64
+
+	// binder is the value of the PSK binder that was validated to
+	// accept the 0-RTT data. Exposed as ConnectionState.Unique0RTTToken.
+	binder []byte
+
 	tmp [16]byte
 }
+
+type handshakeStatus int
+
+const (
+	handshakeRunning handshakeStatus = iota
+	discardingEarlyData
+	readingEarlyData
+	waitingClientFinished
+	readingClientFinished
+	handshakeConfirmed
+)
 
 // Access to net.Conn methods.
 // Cannot just embed net.Conn because that would
@@ -154,10 +186,15 @@ type halfConn struct {
 
 	// used to save allocating a new buffer for each MAC.
 	inDigestBuf, outDigestBuf []byte
+
+	traceErr func(error)
 }
 
 func (hc *halfConn) setErrorLocked(err error) error {
 	hc.err = err
+	if hc.traceErr != nil {
+		hc.traceErr(err)
+	}
 	return err
 }
 
@@ -183,6 +220,14 @@ func (hc *halfConn) changeCipherSpec() error {
 		hc.seq[i] = 0
 	}
 	return nil
+}
+
+func (hc *halfConn) setCipher(version uint16, cipher interface{}) {
+	hc.version = version
+	hc.cipher = cipher
+	for i := range hc.seq {
+		hc.seq[i] = 0
+	}
 }
 
 // incSeq increments the sequence number.
@@ -298,13 +343,17 @@ func (hc *halfConn) decrypt(b *block) (ok bool, prefixLen int, alertValue alert)
 				nonce = hc.seq[:]
 			}
 
-			copy(hc.additionalData[:], hc.seq[:])
-			copy(hc.additionalData[8:], b.data[:3])
-			n := len(payload) - c.Overhead()
-			hc.additionalData[11] = byte(n >> 8)
-			hc.additionalData[12] = byte(n)
+			var additionalData []byte
+			if hc.version < VersionTLS13 {
+				copy(hc.additionalData[:], hc.seq[:])
+				copy(hc.additionalData[8:], b.data[:3])
+				n := len(payload) - c.Overhead()
+				hc.additionalData[11] = byte(n >> 8)
+				hc.additionalData[12] = byte(n)
+				additionalData = hc.additionalData[:]
+			}
 			var err error
-			payload, err = c.Open(payload[:0], nonce, payload, hc.additionalData[:])
+			payload, err = c.Open(payload[:0], nonce, payload, additionalData)
 			if err != nil {
 				return false, 0, alertBadRecordMAC
 			}
@@ -405,20 +454,36 @@ func (hc *halfConn) encrypt(b *block, explicitIVLen int) (bool, alert) {
 			c.XORKeyStream(payload, payload)
 		case aead:
 			payloadLen := len(b.data) - recordHeaderLen - explicitIVLen
-			b.resize(len(b.data) + c.Overhead())
+			overhead := c.Overhead()
+			if hc.version >= VersionTLS13 {
+				overhead++
+			}
+			b.resize(len(b.data) + overhead)
+
 			nonce := b.data[recordHeaderLen : recordHeaderLen+explicitIVLen]
 			if len(nonce) == 0 {
 				nonce = hc.seq[:]
 			}
-			payload := b.data[recordHeaderLen+explicitIVLen:]
+			payload = b.data[recordHeaderLen+explicitIVLen:]
 			payload = payload[:payloadLen]
 
-			copy(hc.additionalData[:], hc.seq[:])
-			copy(hc.additionalData[8:], b.data[:3])
-			hc.additionalData[11] = byte(payloadLen >> 8)
-			hc.additionalData[12] = byte(payloadLen)
+			var additionalData []byte
+			if hc.version < VersionTLS13 {
+				copy(hc.additionalData[:], hc.seq[:])
+				copy(hc.additionalData[8:], b.data[:3])
+				hc.additionalData[11] = byte(payloadLen >> 8)
+				hc.additionalData[12] = byte(payloadLen)
+				additionalData = hc.additionalData[:]
+			}
 
-			c.Seal(payload[:0], nonce, payload, hc.additionalData[:])
+			if hc.version >= VersionTLS13 {
+				// opaque type
+				payload = payload[:len(payload)+1]
+				payload[len(payload)-1] = b.data[0]
+				b.data[0] = byte(recordTypeApplicationData)
+			}
+
+			c.Seal(payload[:0], nonce, payload, additionalData)
 		case cbcMode:
 			blockSize := c.BlockSize()
 			if explicitIVLen > 0 {
@@ -503,6 +568,9 @@ func (b *block) readFromUntil(r io.Reader, n int) error {
 func (b *block) Read(p []byte) (n int, err error) {
 	n = copy(p, b.data[b.off:])
 	b.off += n
+	if b.off >= len(b.data) {
+		err = io.EOF
+	}
 	return
 }
 
@@ -561,6 +629,7 @@ func (c *Conn) newRecordHeaderError(msg string) (err RecordHeaderError) {
 // readRecord reads the next TLS record from the connection
 // and updates the record layer state.
 // c.in.Mutex <= L; c.input == nil.
+// c.input can still be nil after a call, retry if so.
 func (c *Conn) readRecord(want recordType) error {
 	// Caller must be in sync with connection:
 	// handshake data if handshake not yet completed,
@@ -570,18 +639,17 @@ func (c *Conn) readRecord(want recordType) error {
 		c.sendAlert(alertInternalError)
 		return c.in.setErrorLocked(errors.New("tls: unknown record type requested"))
 	case recordTypeHandshake, recordTypeChangeCipherSpec:
-		if c.handshakeComplete {
+		if c.phase != handshakeRunning && c.phase != readingClientFinished {
 			c.sendAlert(alertInternalError)
 			return c.in.setErrorLocked(errors.New("tls: handshake or ChangeCipherSpec requested while not in handshake"))
 		}
 	case recordTypeApplicationData:
-		if !c.handshakeComplete {
+		if c.phase == handshakeRunning || c.phase == readingClientFinished {
 			c.sendAlert(alertInternalError)
 			return c.in.setErrorLocked(errors.New("tls: application data record requested while in handshake"))
 		}
 	}
 
-Again:
 	if c.rawInput == nil {
 		c.rawInput = c.in.newBlock()
 	}
@@ -613,11 +681,6 @@ Again:
 
 	vers := uint16(b.data[1])<<8 | uint16(b.data[2])
 	n := int(b.data[3])<<8 | int(b.data[4])
-	if c.haveVers && vers != c.vers {
-		c.sendAlert(alertProtocolVersion)
-		msg := fmt.Sprintf("received record with version %x when expecting version %x", vers, c.vers)
-		return c.in.setErrorLocked(c.newRecordHeaderError(msg))
-	}
 	if n > maxCiphertext {
 		c.sendAlert(alertRecordOverflow)
 		msg := fmt.Sprintf("oversized record received with length %d", n)
@@ -645,17 +708,52 @@ Again:
 
 	// Process message.
 	b, c.rawInput = c.in.splitBlock(b, recordHeaderLen+n)
+	peekedAlert := peekAlert(b) // peek at a possible alert before decryption
 	ok, off, alertValue := c.in.decrypt(b)
-	if !ok {
+	switch {
+	case !ok && c.phase == discardingEarlyData:
+		// If the client said that it's sending early data and we did not
+		// accept it, we are expected to fail decryption.
 		c.in.freeBlock(b)
-		return c.in.setErrorLocked(c.sendAlert(alertValue))
+		return nil
+	case ok && c.phase == discardingEarlyData:
+		c.phase = waitingClientFinished
+	case !ok:
+		c.in.traceErr, c.out.traceErr = nil, nil // not that interesting
+		c.in.freeBlock(b)
+		err := c.sendAlert(alertValue)
+		// If decryption failed because the message is an unencrypted
+		// alert, return a more meaningful error message
+		if alertValue == alertBadRecordMAC && peekedAlert != nil {
+			err = peekedAlert
+		}
+		return c.in.setErrorLocked(err)
 	}
 	b.off = off
 	data := b.data[b.off:]
 	if len(data) > maxPlaintext {
-		err := c.sendAlert(alertRecordOverflow)
 		c.in.freeBlock(b)
-		return c.in.setErrorLocked(err)
+		return c.in.setErrorLocked(c.sendAlert(alertRecordOverflow))
+	}
+
+	// After checking the plaintext length, remove 1.3 padding and
+	// extract the real content type.
+	// See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-5.4.
+	if c.vers >= VersionTLS13 {
+		i := len(data) - 1
+		for i >= 0 {
+			if data[i] != 0 {
+				break
+			}
+			i--
+		}
+		if i < 0 {
+			c.in.freeBlock(b)
+			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		}
+		typ = recordType(data[i])
+		data = data[:i]
+		b.resize(b.off + i) // shrinks, guaranteed not to reallocate
 	}
 
 	switch typ {
@@ -671,11 +769,15 @@ Again:
 			c.in.setErrorLocked(io.EOF)
 			break
 		}
+		if alert(data[1]) == alertEndOfEarlyData {
+			c.handleEndOfEarlyData()
+			break
+		}
 		switch data[0] {
 		case alertLevelWarning:
 			// drop on the floor
 			c.in.freeBlock(b)
-			goto Again
+			return nil
 		case alertLevelError:
 			c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])})
 		default:
@@ -683,7 +785,7 @@ Again:
 		}
 
 	case recordTypeChangeCipherSpec:
-		if typ != want || len(data) != 1 || data[0] != 1 {
+		if typ != want || len(data) != 1 || data[0] != 1 || c.vers >= VersionTLS13 {
 			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 			break
 		}
@@ -698,25 +800,51 @@ Again:
 		}
 
 	case recordTypeApplicationData:
-		if typ != want {
+		if typ != want || c.phase == waitingClientFinished {
 			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 			break
+		}
+		if c.phase == readingEarlyData {
+			c.earlyDataBytes += int64(len(b.data) - b.off)
+			if c.earlyDataBytes > c.ticketMaxEarlyData {
+				return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+			}
 		}
 		c.input = b
 		b = nil
 
 	case recordTypeHandshake:
 		// TODO(rsc): Should at least pick off connection close.
-		if typ != want && !(c.isClient && c.config.Renegotiation != RenegotiateNever) {
+		if typ != want && !(c.isClient && c.config.Renegotiation != RenegotiateNever) &&
+			c.phase != waitingClientFinished {
 			return c.in.setErrorLocked(c.sendAlert(alertNoRenegotiation))
 		}
 		c.hand.Write(data)
+		if typ != want && c.phase == waitingClientFinished {
+			if err := c.hs.readClientFinished13(); err != nil {
+				c.in.setErrorLocked(err)
+				break
+			}
+		}
 	}
 
 	if b != nil {
 		c.in.freeBlock(b)
 	}
 	return c.in.err
+}
+
+// peekAlert looks at a message to spot an unencrypted alert. It must be
+// called before decryption to avoid a side channel, and its result must
+// only be used if decryption fails, to avoid false positives.
+func peekAlert(b *block) error {
+	if len(b.data) < 7 {
+		return nil
+	}
+	if recordType(b.data[0]) != recordTypeAlert {
+		return nil
+	}
+	return &net.OpError{Op: "remote error", Err: alert(b.data[6])}
 }
 
 // sendAlert sends a TLS alert message.
@@ -801,6 +929,9 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType, explicitIVLen int) int {
 			payloadBytes -= macSize
 		case cipher.AEAD:
 			payloadBytes -= ciph.Overhead()
+			if c.vers >= VersionTLS13 {
+				payloadBytes -= 1 // ContentType
+			}
 		case cbcMode:
 			blockSize := ciph.BlockSize()
 			// The payload must fit in a multiple of blockSize, with
@@ -896,6 +1027,11 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 			// greater than TLS 1.0 for the initial ClientHello.
 			vers = VersionTLS10
 		}
+		if c.vers >= VersionTLS13 {
+			// TLS 1.3 froze the record layer version at { 3, 1 }.
+			// See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-5.1.
+			vers = VersionTLS10
+		}
 		b.data[1] = byte(vers >> 8)
 		b.data[2] = byte(vers)
 		b.data[3] = byte(m >> 8)
@@ -973,11 +1109,25 @@ func (c *Conn) readHandshake() (interface{}, error) {
 	case typeClientHello:
 		m = new(clientHelloMsg)
 	case typeServerHello:
-		m = new(serverHelloMsg)
+		if c.vers >= VersionTLS13 {
+			m = new(serverHelloMsg13)
+		} else {
+			m = new(serverHelloMsg)
+		}
+	case typeEncryptedExtensions:
+		m = new(encryptedExtensionsMsg)
 	case typeNewSessionTicket:
-		m = new(newSessionTicketMsg)
+		if c.vers >= VersionTLS13 {
+			m = new(newSessionTicketMsg13)
+		} else {
+			m = new(newSessionTicketMsg)
+		}
 	case typeCertificate:
-		m = new(certificateMsg)
+		if c.vers >= VersionTLS13 {
+			m = new(certificateMsg13)
+		} else {
+			m = new(certificateMsg)
+		}
 	case typeCertificateRequest:
 		m = &certificateRequestMsg{
 			hasSignatureAndHash: c.vers >= VersionTLS12,
@@ -1007,8 +1157,8 @@ func (c *Conn) readHandshake() (interface{}, error) {
 	// so pass in a fresh copy that won't be overwritten.
 	data = append([]byte(nil), data...)
 
-	if !m.unmarshal(data) {
-		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+	if unmarshalAlert := m.unmarshal(data); unmarshalAlert != alertSuccess {
+		return nil, c.in.setErrorLocked(c.sendAlert(unmarshalAlert))
 	}
 	return m, nil
 }
@@ -1093,6 +1243,10 @@ func (c *Conn) handleRenegotiation() error {
 		return c.sendAlert(alertNoRenegotiation)
 	}
 
+	if c.vers >= VersionTLS13 {
+		return c.sendAlert(alertNoRenegotiation)
+	}
+
 	switch c.config.Renegotiation {
 	case RenegotiateNever:
 		return c.sendAlert(alertNoRenegotiation)
@@ -1110,11 +1264,116 @@ func (c *Conn) handleRenegotiation() error {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
 
+	c.phase = handshakeRunning
 	c.handshakeComplete = false
 	if c.handshakeErr = c.clientHandshake(); c.handshakeErr == nil {
 		c.handshakes++
 	}
 	return c.handshakeErr
+}
+
+// ConfirmHandshake waits for the handshake to reach a point at which
+// the connection is certainly not replayed. That is, after receiving
+// the Client Finished.
+//
+// If ConfirmHandshake returns an error and until ConfirmHandshake
+// returns, the 0-RTT data should not be trusted not to be replayed.
+//
+// This is only meaningful in TLS 1.3 when Accept0RTTData is true and the
+// client sent valid 0-RTT data. In any other case it's equivalent to
+// calling Handshake.
+func (c *Conn) ConfirmHandshake() error {
+	if err := c.Handshake(); err != nil {
+		return err
+	}
+
+	if c.vers < VersionTLS13 {
+		return nil
+	}
+
+	c.confirmMutex.Lock()
+	if atomic.LoadInt32(&c.handshakeConfirmed) == 1 { // c.phase == handshakeConfirmed
+		c.confirmMutex.Unlock()
+		return nil
+	} else {
+		defer func() {
+			// If we transitioned to handshakeConfirmed we already released the lock,
+			// otherwise do it here.
+			if c.phase != handshakeConfirmed {
+				c.confirmMutex.Unlock()
+			}
+		}()
+	}
+
+	c.in.Lock()
+	defer c.in.Unlock()
+
+	var input *block
+	if c.phase == readingEarlyData || c.input != nil {
+		buf := &bytes.Buffer{}
+		if _, err := buf.ReadFrom(earlyDataReader{c}); err != nil {
+			c.in.setErrorLocked(err)
+			return err
+		}
+		input = &block{data: buf.Bytes()}
+	}
+
+	for c.phase != handshakeConfirmed {
+		if err := c.readRecord(recordTypeApplicationData); err != nil {
+			c.in.setErrorLocked(err)
+			return err
+		}
+	}
+
+	if c.phase != handshakeConfirmed {
+		panic("should have reached handshakeConfirmed state")
+	}
+	if c.input != nil {
+		panic("should not have read past the Client Finished")
+	}
+
+	c.input = input
+
+	return nil
+}
+
+// earlyDataReader wraps a Conn and reads only early data, both buffered
+// and still on the wire.
+type earlyDataReader struct {
+	c *Conn
+}
+
+// c.in.Mutex <= L
+func (r earlyDataReader) Read(b []byte) (n int, err error) {
+	c := r.c
+
+	if c.phase == handshakeConfirmed {
+		// c.input might not be early data
+		panic("earlyDataReader called at handshakeConfirmed")
+	}
+
+	for c.input == nil && c.in.err == nil && c.phase == readingEarlyData {
+		if err := c.readRecord(recordTypeApplicationData); err != nil {
+			return 0, err
+		}
+	}
+	if err := c.in.err; err != nil {
+		return 0, err
+	}
+
+	if c.input != nil {
+		n, err = c.input.Read(b)
+		if err == io.EOF {
+			err = nil
+			c.in.freeBlock(c.input)
+			c.input = nil
+		}
+	}
+
+	if err == nil && c.phase != readingEarlyData && c.input == nil {
+		err = io.EOF
+	}
+	return
 }
 
 // Read can be made to time out and return a net.Error with Timeout() == true
@@ -1127,6 +1386,19 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		// Put this after Handshake, in case people were calling
 		// Read(nil) for the side effect of the Handshake.
 		return
+	}
+
+	c.confirmMutex.Lock()
+	if atomic.LoadInt32(&c.handshakeConfirmed) == 1 { // c.phase == handshakeConfirmed
+		c.confirmMutex.Unlock()
+	} else {
+		defer func() {
+			// If we transitioned to handshakeConfirmed we already released the lock,
+			// otherwise do it here.
+			if c.phase != handshakeConfirmed {
+				c.confirmMutex.Unlock()
+			}
+		}()
 	}
 
 	c.in.Lock()
@@ -1154,7 +1426,8 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 		}
 
 		n, err = c.input.Read(b)
-		if c.input.off >= len(c.input.data) {
+		if err == io.EOF {
+			err = nil
 			c.in.freeBlock(c.input)
 			c.input = nil
 		}
@@ -1253,60 +1526,32 @@ func (c *Conn) closeNotify() error {
 // protocol if it has not yet been run.
 // Most uses of this package need not call Handshake
 // explicitly: the first Read or Write will call it automatically.
+//
+// In TLS 1.3 Handshake returns after the client and server first flights,
+// without waiting for the Client Finished.
 func (c *Conn) Handshake() error {
-	// c.handshakeErr and c.handshakeComplete are protected by
-	// c.handshakeMutex. In order to perform a handshake, we need to lock
-	// c.in also and c.handshakeMutex must be locked after c.in.
-	//
-	// However, if a Read() operation is hanging then it'll be holding the
-	// lock on c.in and so taking it here would cause all operations that
-	// need to check whether a handshake is pending (such as Write) to
-	// block.
-	//
-	// Thus we first take c.handshakeMutex to check whether a handshake is
-	// needed.
-	//
-	// If so then, previously, this code would unlock handshakeMutex and
-	// then lock c.in and handshakeMutex in the correct order to run the
-	// handshake. The problem was that it was possible for a Read to
-	// complete the handshake once handshakeMutex was unlocked and then
-	// keep c.in while waiting for network data. Thus a concurrent
-	// operation could be blocked on c.in.
-	//
-	// Thus handshakeCond is used to signal that a goroutine is committed
-	// to running the handshake and other goroutines can wait on it if they
-	// need. handshakeCond is protected by handshakeMutex.
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
 
-	for {
-		if err := c.handshakeErr; err != nil {
-			return err
-		}
-		if c.handshakeComplete {
-			return nil
-		}
-		if c.handshakeCond == nil {
-			break
-		}
-
-		c.handshakeCond.Wait()
+	if err := c.handshakeErr; err != nil {
+		return err
 	}
-
-	// Set handshakeCond to indicate that this goroutine is committing to
-	// running the handshake.
-	c.handshakeCond = sync.NewCond(&c.handshakeMutex)
-	c.handshakeMutex.Unlock()
+	if c.handshakeComplete {
+		return nil
+	}
 
 	c.in.Lock()
 	defer c.in.Unlock()
-
-	c.handshakeMutex.Lock()
 
 	// The handshake cannot have completed when handshakeMutex was unlocked
 	// because this goroutine set handshakeCond.
 	if c.handshakeErr != nil || c.handshakeComplete {
 		panic("handshake should not have been able to complete after handshakeCond was set")
+	}
+
+	c.connID = make([]byte, 8)
+	if _, err := io.ReadFull(c.config.rand(), c.connID); err != nil {
+		return err
 	}
 
 	if c.isClient {
@@ -1326,11 +1571,6 @@ func (c *Conn) Handshake() error {
 		panic("handshake should have had a result.")
 	}
 
-	// Wake any other goroutines that are waiting for this handshake to
-	// complete.
-	c.handshakeCond.Broadcast()
-	c.handshakeCond = nil
-
 	return c.handshakeErr
 }
 
@@ -1344,6 +1584,8 @@ func (c *Conn) ConnectionState() ConnectionState {
 	state.ServerName = c.serverName
 
 	if c.handshakeComplete {
+		state.ConnectionID = c.connID
+		state.ClientHello = c.clientHello
 		state.Version = c.vers
 		state.NegotiatedProtocol = c.clientProtocol
 		state.DidResume = c.didResume
@@ -1353,6 +1595,10 @@ func (c *Conn) ConnectionState() ConnectionState {
 		state.VerifiedChains = c.verifiedChains
 		state.SignedCertificateTimestamps = c.scts
 		state.OCSPResponse = c.ocspResponse
+		state.HandshakeConfirmed = atomic.LoadInt32(&c.handshakeConfirmed) == 1
+		if !state.HandshakeConfirmed {
+			state.Unique0RTTToken = c.binder
+		}
 		if !c.didResume {
 			if c.clientFinishedIsFirst {
 				state.TLSUnique = c.clientFinished[:]

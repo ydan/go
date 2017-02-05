@@ -11,6 +11,7 @@ import (
 
 type clientHelloMsg struct {
 	raw                          []byte
+	rawTruncated                 []byte // for PSK binding
 	vers                         uint16
 	random                       []byte
 	sessionId                    []byte
@@ -28,6 +29,11 @@ type clientHelloMsg struct {
 	secureRenegotiation          []byte
 	secureRenegotiationSupported bool
 	alpnProtocols                []string
+	keyShares                    []keyShare
+	supportedVersions            []uint16
+	psks                         []psk
+	pskKeyExchangeModes          []uint8
+	earlyData                    bool
 }
 
 func (m *clientHelloMsg) equal(i interface{}) bool {
@@ -53,7 +59,10 @@ func (m *clientHelloMsg) equal(i interface{}) bool {
 		eqSignatureAlgorithms(m.supportedSignatureAlgorithms, m1.supportedSignatureAlgorithms) &&
 		m.secureRenegotiationSupported == m1.secureRenegotiationSupported &&
 		bytes.Equal(m.secureRenegotiation, m1.secureRenegotiation) &&
-		eqStrings(m.alpnProtocols, m1.alpnProtocols)
+		eqStrings(m.alpnProtocols, m1.alpnProtocols) &&
+		eqKeyShares(m.keyShares, m1.keyShares) &&
+		eqUint16s(m.supportedVersions, m1.supportedVersions) &&
+		m.earlyData == m1.earlyData
 }
 
 func (m *clientHelloMsg) marshal() []byte {
@@ -107,6 +116,20 @@ func (m *clientHelloMsg) marshal() []byte {
 		numExtensions++
 	}
 	if m.scts {
+		numExtensions++
+	}
+	if len(m.keyShares) > 0 {
+		extensionsLength += 2
+		for _, k := range m.keyShares {
+			extensionsLength += 4 + len(k.data)
+		}
+		numExtensions++
+	}
+	if len(m.supportedVersions) > 0 {
+		extensionsLength += 1 + 2*len(m.supportedVersions)
+		numExtensions++
+	}
+	if m.earlyData {
 		numExtensions++
 	}
 	if numExtensions > 0 {
@@ -193,6 +216,7 @@ func (m *clientHelloMsg) marshal() []byte {
 	}
 	if len(m.supportedCurves) > 0 {
 		// http://tools.ietf.org/html/rfc4492#section-5.5.1
+		// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.4
 		z[0] = byte(extensionSupportedCurves >> 8)
 		z[1] = byte(extensionSupportedCurves)
 		l := 2 + 2*len(m.supportedCurves)
@@ -236,6 +260,7 @@ func (m *clientHelloMsg) marshal() []byte {
 	}
 	if len(m.supportedSignatureAlgorithms) > 0 {
 		// https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
+		// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.3
 		z[0] = byte(extensionSignatureAlgorithms >> 8)
 		z[1] = byte(extensionSignatureAlgorithms)
 		l := 2 + 2*len(m.supportedSignatureAlgorithms)
@@ -291,33 +316,78 @@ func (m *clientHelloMsg) marshal() []byte {
 		// zero uint16 for the zero-length extension_data
 		z = z[4:]
 	}
+	if len(m.keyShares) > 0 {
+		// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.5
+		z[0] = byte(extensionKeyShare >> 8)
+		z[1] = byte(extensionKeyShare)
+		lengths := z[2:]
+		z = z[6:]
+
+		totalLength := 0
+		for _, ks := range m.keyShares {
+			z[0] = byte(ks.group >> 8)
+			z[1] = byte(ks.group)
+			z[2] = byte(len(ks.data) >> 8)
+			z[3] = byte(len(ks.data))
+			copy(z[4:], ks.data)
+			z = z[4+len(ks.data):]
+			totalLength += 4 + len(ks.data)
+		}
+
+		lengths[2] = byte(totalLength >> 8)
+		lengths[3] = byte(totalLength)
+		totalLength += 2
+		lengths[0] = byte(totalLength >> 8)
+		lengths[1] = byte(totalLength)
+	}
+	if len(m.supportedVersions) > 0 {
+		z[0] = byte(extensionSupportedVersions >> 8)
+		z[1] = byte(extensionSupportedVersions)
+		l := 1 + 2*len(m.supportedVersions)
+		z[2] = byte(l >> 8)
+		z[3] = byte(l)
+		l -= 1
+		z[4] = byte(l)
+		z = z[5:]
+		for _, v := range m.supportedVersions {
+			z[0] = byte(v >> 8)
+			z[1] = byte(v)
+			z = z[2:]
+		}
+	}
+	if m.earlyData {
+		z[0] = byte(extensionEarlyData >> 8)
+		z[1] = byte(extensionEarlyData)
+		z = z[4:]
+	}
 
 	m.raw = x
 
 	return x
 }
 
-func (m *clientHelloMsg) unmarshal(data []byte) bool {
+func (m *clientHelloMsg) unmarshal(data []byte) alert {
 	if len(data) < 42 {
-		return false
+		return alertDecodeError
 	}
 	m.raw = data
 	m.vers = uint16(data[4])<<8 | uint16(data[5])
 	m.random = data[6:38]
 	sessionIdLen := int(data[38])
 	if sessionIdLen > 32 || len(data) < 39+sessionIdLen {
-		return false
+		return alertDecodeError
 	}
 	m.sessionId = data[39 : 39+sessionIdLen]
 	data = data[39+sessionIdLen:]
+	bindersOffset := 39 + sessionIdLen
 	if len(data) < 2 {
-		return false
+		return alertDecodeError
 	}
 	// cipherSuiteLen is the number of bytes of cipher suite numbers. Since
 	// they are uint16s, the number must be even.
 	cipherSuiteLen := int(data[0])<<8 | int(data[1])
 	if cipherSuiteLen%2 == 1 || len(data) < 2+cipherSuiteLen {
-		return false
+		return alertDecodeError
 	}
 	numCipherSuites := cipherSuiteLen / 2
 	m.cipherSuites = make([]uint16, numCipherSuites)
@@ -328,16 +398,18 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 		}
 	}
 	data = data[2+cipherSuiteLen:]
+	bindersOffset += 2 + cipherSuiteLen
 	if len(data) < 1 {
-		return false
+		return alertDecodeError
 	}
 	compressionMethodsLen := int(data[0])
 	if len(data) < 1+compressionMethodsLen {
-		return false
+		return alertDecodeError
 	}
 	m.compressionMethods = data[1 : 1+compressionMethodsLen]
 
 	data = data[1+compressionMethodsLen:]
+	bindersOffset += 1 + compressionMethodsLen
 
 	m.nextProtoNeg = false
 	m.serverName = ""
@@ -347,52 +419,59 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 	m.supportedSignatureAlgorithms = nil
 	m.alpnProtocols = nil
 	m.scts = false
+	m.keyShares = nil
+	m.supportedVersions = nil
+	m.psks = nil
+	m.pskKeyExchangeModes = nil
+	m.earlyData = false
 
 	if len(data) == 0 {
 		// ClientHello is optionally followed by extension data
-		return true
+		return alertSuccess
 	}
 	if len(data) < 2 {
-		return false
+		return alertDecodeError
 	}
 
 	extensionsLength := int(data[0])<<8 | int(data[1])
 	data = data[2:]
+	bindersOffset += 2
 	if extensionsLength != len(data) {
-		return false
+		return alertDecodeError
 	}
 
 	for len(data) != 0 {
 		if len(data) < 4 {
-			return false
+			return alertDecodeError
 		}
 		extension := uint16(data[0])<<8 | uint16(data[1])
 		length := int(data[2])<<8 | int(data[3])
 		data = data[4:]
+		bindersOffset += 4
 		if len(data) < length {
-			return false
+			return alertDecodeError
 		}
 
 		switch extension {
 		case extensionServerName:
 			d := data[:length]
 			if len(d) < 2 {
-				return false
+				return alertDecodeError
 			}
 			namesLen := int(d[0])<<8 | int(d[1])
 			d = d[2:]
 			if len(d) != namesLen {
-				return false
+				return alertDecodeError
 			}
 			for len(d) > 0 {
 				if len(d) < 3 {
-					return false
+					return alertDecodeError
 				}
 				nameType := d[0]
 				nameLen := int(d[1])<<8 | int(d[2])
 				d = d[3:]
 				if len(d) < nameLen {
-					return false
+					return alertDecodeError
 				}
 				if nameType == 0 {
 					m.serverName = string(d[:nameLen])
@@ -400,7 +479,8 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 					// trailing dot. See
 					// https://tools.ietf.org/html/rfc6066#section-3.
 					if strings.HasSuffix(m.serverName, ".") {
-						return false
+						// TODO use alertDecodeError?
+						return alertUnexpectedMessage
 					}
 					break
 				}
@@ -408,19 +488,20 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			}
 		case extensionNextProtoNeg:
 			if length > 0 {
-				return false
+				return alertDecodeError
 			}
 			m.nextProtoNeg = true
 		case extensionStatusRequest:
 			m.ocspStapling = length > 0 && data[0] == statusTypeOCSP
 		case extensionSupportedCurves:
 			// http://tools.ietf.org/html/rfc4492#section-5.5.1
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.4
 			if length < 2 {
-				return false
+				return alertDecodeError
 			}
 			l := int(data[0])<<8 | int(data[1])
 			if l%2 == 1 || length != l+2 {
-				return false
+				return alertDecodeError
 			}
 			numCurves := l / 2
 			m.supportedCurves = make([]CurveID, numCurves)
@@ -432,11 +513,11 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 		case extensionSupportedPoints:
 			// http://tools.ietf.org/html/rfc4492#section-5.5.2
 			if length < 1 {
-				return false
+				return alertDecodeError
 			}
 			l := int(data[0])
 			if length != l+1 {
-				return false
+				return alertDecodeError
 			}
 			m.supportedPoints = make([]uint8, l)
 			copy(m.supportedPoints, data[1:])
@@ -446,12 +527,13 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			m.sessionTicket = data[:length]
 		case extensionSignatureAlgorithms:
 			// https://tools.ietf.org/html/rfc5246#section-7.4.1.4.1
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.3
 			if length < 2 || length&1 != 0 {
-				return false
+				return alertDecodeError
 			}
 			l := int(data[0])<<8 | int(data[1])
 			if l != length-2 {
-				return false
+				return alertDecodeError
 			}
 			n := l / 2
 			d := data[2:]
@@ -462,31 +544,31 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 			}
 		case extensionRenegotiationInfo:
 			if length == 0 {
-				return false
+				return alertDecodeError
 			}
 			d := data[:length]
 			l := int(d[0])
 			d = d[1:]
 			if l != len(d) {
-				return false
+				return alertDecodeError
 			}
 
 			m.secureRenegotiation = d
 			m.secureRenegotiationSupported = true
 		case extensionALPN:
 			if length < 2 {
-				return false
+				return alertDecodeError
 			}
 			l := int(data[0])<<8 | int(data[1])
 			if l != length-2 {
-				return false
+				return alertDecodeError
 			}
 			d := data[2:length]
 			for len(d) != 0 {
 				stringLen := int(d[0])
 				d = d[1:]
 				if stringLen == 0 || stringLen > len(d) {
-					return false
+					return alertDecodeError
 				}
 				m.alpnProtocols = append(m.alpnProtocols, string(d[:stringLen]))
 				d = d[stringLen:]
@@ -494,13 +576,124 @@ func (m *clientHelloMsg) unmarshal(data []byte) bool {
 		case extensionSCT:
 			m.scts = true
 			if length != 0 {
-				return false
+				return alertDecodeError
 			}
+		case extensionKeyShare:
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.5
+			if length < 2 {
+				return alertDecodeError
+			}
+			l := int(data[0])<<8 | int(data[1])
+			if l != length-2 {
+				return alertDecodeError
+			}
+			d := data[2:length]
+			for len(d) != 0 {
+				if len(d) < 4 {
+					return alertDecodeError
+				}
+				dataLen := int(d[2])<<8 | int(d[3])
+				if dataLen == 0 || 4+dataLen > len(d) {
+					return alertDecodeError
+				}
+				m.keyShares = append(m.keyShares, keyShare{
+					group: CurveID(d[0])<<8 | CurveID(d[1]),
+					data:  d[4 : 4+dataLen],
+				})
+				d = d[4+dataLen:]
+			}
+		case extensionSupportedVersions:
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.1
+			if length < 1 {
+				return alertDecodeError
+			}
+			l := int(data[0])
+			if l%2 == 1 || length != l+1 {
+				return alertDecodeError
+			}
+			n := l / 2
+			d := data[1:]
+			for i := 0; i < n; i++ {
+				v := uint16(d[0])<<8 + uint16(d[1])
+				m.supportedVersions = append(m.supportedVersions, v)
+				d = d[2:]
+			}
+		case extensionPreSharedKey:
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.6
+			if length < 2 {
+				return alertDecodeError
+			}
+			// Ensure this extension is the last one in the Client Hello
+			if len(data) != length {
+				return alertIllegalParameter
+			}
+			li := int(data[0])<<8 | int(data[1])
+			if 2+li+2 > length {
+				return alertDecodeError
+			}
+			d := data[2 : 2+li]
+			bindersOffset += 2 + li
+			for len(d) > 0 {
+				if len(d) < 6 {
+					return alertDecodeError
+				}
+				l := int(d[0])<<8 | int(d[1])
+				if len(d) < 2+l+4 {
+					return alertDecodeError
+				}
+				m.psks = append(m.psks, psk{
+					identity: d[2 : 2+l],
+					obfTicketAge: uint32(d[l+2])<<24 | uint32(d[l+3])<<16 |
+						uint32(d[l+4])<<8 | uint32(d[l+5]),
+				})
+				d = d[2+l+4:]
+			}
+			lb := int(data[li+2])<<8 | int(data[li+3])
+			d = data[2+li+2:]
+			if lb != len(d) || lb == 0 {
+				return alertDecodeError
+			}
+			i := 0
+			for len(d) > 0 {
+				if i >= len(m.psks) {
+					return alertIllegalParameter
+				}
+				if len(d) < 1 {
+					return alertDecodeError
+				}
+				l := int(d[0])
+				if l > len(d)-1 {
+					return alertDecodeError
+				}
+				if i >= len(m.psks) {
+					return alertIllegalParameter
+				}
+				m.psks[i].binder = d[1 : 1+l]
+				d = d[1+l:]
+				i++
+			}
+			if i != len(m.psks) {
+				return alertIllegalParameter
+			}
+			m.rawTruncated = m.raw[:bindersOffset]
+		case extensionPSKKeyExchangeModes:
+			if length < 2 {
+				return alertDecodeError
+			}
+			l := int(data[0])
+			if length != l+1 {
+				return alertDecodeError
+			}
+			m.pskKeyExchangeModes = data[1:length]
+		case extensionEarlyData:
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.8
+			m.earlyData = true
 		}
 		data = data[length:]
+		bindersOffset += length
 	}
 
-	return true
+	return alertSuccess
 }
 
 type serverHelloMsg struct {
@@ -694,21 +887,21 @@ func (m *serverHelloMsg) marshal() []byte {
 	return x
 }
 
-func (m *serverHelloMsg) unmarshal(data []byte) bool {
+func (m *serverHelloMsg) unmarshal(data []byte) alert {
 	if len(data) < 42 {
-		return false
+		return alertDecodeError
 	}
 	m.raw = data
 	m.vers = uint16(data[4])<<8 | uint16(data[5])
 	m.random = data[6:38]
 	sessionIdLen := int(data[38])
 	if sessionIdLen > 32 || len(data) < 39+sessionIdLen {
-		return false
+		return alertDecodeError
 	}
 	m.sessionId = data[39 : 39+sessionIdLen]
 	data = data[39+sessionIdLen:]
 	if len(data) < 3 {
-		return false
+		return alertDecodeError
 	}
 	m.cipherSuite = uint16(data[0])<<8 | uint16(data[1])
 	m.compressionMethod = data[2]
@@ -723,27 +916,27 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 
 	if len(data) == 0 {
 		// ServerHello is optionally followed by extension data
-		return true
+		return alertSuccess
 	}
 	if len(data) < 2 {
-		return false
+		return alertDecodeError
 	}
 
 	extensionsLength := int(data[0])<<8 | int(data[1])
 	data = data[2:]
 	if len(data) != extensionsLength {
-		return false
+		return alertDecodeError
 	}
 
 	for len(data) != 0 {
 		if len(data) < 4 {
-			return false
+			return alertDecodeError
 		}
 		extension := uint16(data[0])<<8 | uint16(data[1])
 		length := int(data[2])<<8 | int(data[3])
 		data = data[4:]
 		if len(data) < length {
-			return false
+			return alertDecodeError
 		}
 
 		switch extension {
@@ -754,30 +947,30 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 				l := int(d[0])
 				d = d[1:]
 				if l == 0 || l > len(d) {
-					return false
+					return alertDecodeError
 				}
 				m.nextProtos = append(m.nextProtos, string(d[:l]))
 				d = d[l:]
 			}
 		case extensionStatusRequest:
 			if length > 0 {
-				return false
+				return alertDecodeError
 			}
 			m.ocspStapling = true
 		case extensionSessionTicket:
 			if length > 0 {
-				return false
+				return alertDecodeError
 			}
 			m.ticketSupported = true
 		case extensionRenegotiationInfo:
 			if length == 0 {
-				return false
+				return alertDecodeError
 			}
 			d := data[:length]
 			l := int(d[0])
 			d = d[1:]
 			if l != len(d) {
-				return false
+				return alertDecodeError
 			}
 
 			m.secureRenegotiation = d
@@ -785,44 +978,44 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 		case extensionALPN:
 			d := data[:length]
 			if len(d) < 3 {
-				return false
+				return alertDecodeError
 			}
 			l := int(d[0])<<8 | int(d[1])
 			if l != len(d)-2 {
-				return false
+				return alertDecodeError
 			}
 			d = d[2:]
 			l = int(d[0])
 			if l != len(d)-1 {
-				return false
+				return alertDecodeError
 			}
 			d = d[1:]
 			if len(d) == 0 {
 				// ALPN protocols must not be empty.
-				return false
+				return alertDecodeError
 			}
 			m.alpnProtocol = string(d)
 		case extensionSCT:
 			d := data[:length]
 
 			if len(d) < 2 {
-				return false
+				return alertDecodeError
 			}
 			l := int(d[0])<<8 | int(d[1])
 			d = d[2:]
 			if len(d) != l || l == 0 {
-				return false
+				return alertDecodeError
 			}
 
 			m.scts = make([][]byte, 0, 3)
 			for len(d) != 0 {
 				if len(d) < 2 {
-					return false
+					return alertDecodeError
 				}
 				sctLen := int(d[0])<<8 | int(d[1])
 				d = d[2:]
 				if sctLen == 0 || len(d) < sctLen {
-					return false
+					return alertDecodeError
 				}
 				m.scts = append(m.scts, d[:sctLen])
 				d = d[sctLen:]
@@ -831,7 +1024,269 @@ func (m *serverHelloMsg) unmarshal(data []byte) bool {
 		data = data[length:]
 	}
 
-	return true
+	return alertSuccess
+}
+
+type serverHelloMsg13 struct {
+	raw         []byte
+	vers        uint16
+	random      []byte
+	cipherSuite uint16
+	keyShare    keyShare
+	psk         bool
+	pskIdentity uint16
+}
+
+func (m *serverHelloMsg13) equal(i interface{}) bool {
+	m1, ok := i.(*serverHelloMsg13)
+	if !ok {
+		return false
+	}
+
+	return bytes.Equal(m.raw, m1.raw) &&
+		m.vers == m1.vers &&
+		bytes.Equal(m.random, m1.random) &&
+		m.cipherSuite == m1.cipherSuite &&
+		m.keyShare.group == m1.keyShare.group &&
+		bytes.Equal(m.keyShare.data, m1.keyShare.data) &&
+		m.psk == m1.psk &&
+		m.pskIdentity == m1.pskIdentity
+}
+
+func (m *serverHelloMsg13) marshal() []byte {
+	if m.raw != nil {
+		return m.raw
+	}
+
+	length := 38
+	if m.keyShare.group != 0 {
+		length += 8 + len(m.keyShare.data)
+	}
+	if m.psk {
+		length += 6
+	}
+
+	x := make([]byte, 4+length)
+	x[0] = typeServerHello
+	x[1] = uint8(length >> 16)
+	x[2] = uint8(length >> 8)
+	x[3] = uint8(length)
+	x[4] = uint8(m.vers >> 8)
+	x[5] = uint8(m.vers)
+	copy(x[6:38], m.random)
+	x[38] = uint8(m.cipherSuite >> 8)
+	x[39] = uint8(m.cipherSuite)
+
+	z := x[42:]
+	x[40] = uint8(len(z) >> 8)
+	x[41] = uint8(len(z))
+
+	if m.psk {
+		z[0] = byte(extensionPreSharedKey >> 8)
+		z[1] = byte(extensionPreSharedKey)
+		z[3] = 2
+		z[4] = byte(m.pskIdentity >> 8)
+		z[5] = byte(m.pskIdentity)
+		z = z[6:]
+	}
+
+	if m.keyShare.group != 0 {
+		z[0] = uint8(extensionKeyShare >> 8)
+		z[1] = uint8(extensionKeyShare)
+		l := 4 + len(m.keyShare.data)
+		z[2] = uint8(l >> 8)
+		z[3] = uint8(l)
+		z[4] = uint8(m.keyShare.group >> 8)
+		z[5] = uint8(m.keyShare.group)
+		l -= 4
+		z[6] = uint8(l >> 8)
+		z[7] = uint8(l)
+		copy(z[8:], m.keyShare.data)
+	}
+
+	m.raw = x
+	return x
+}
+
+func (m *serverHelloMsg13) unmarshal(data []byte) alert {
+	if len(data) < 50 {
+		return alertDecodeError
+	}
+	m.raw = data
+	m.vers = uint16(data[4])<<8 | uint16(data[5])
+	m.random = data[6:38]
+	m.cipherSuite = uint16(data[38])<<8 | uint16(data[39])
+	m.psk = false
+	m.pskIdentity = 0
+
+	extensionsLength := int(data[40])<<8 | int(data[41])
+	data = data[42:]
+	if len(data) != extensionsLength {
+		return alertDecodeError
+	}
+
+	for len(data) != 0 {
+		if len(data) < 4 {
+			return alertDecodeError
+		}
+		extension := uint16(data[0])<<8 | uint16(data[1])
+		length := int(data[2])<<8 | int(data[3])
+		data = data[4:]
+		if len(data) < length {
+			return alertDecodeError
+		}
+
+		switch extension {
+		default:
+			return alertDecodeError
+		case extensionPreSharedKey:
+			if length != 2 {
+				return alertDecodeError
+			}
+			m.psk = true
+			m.pskIdentity = uint16(data[0])<<8 | uint16(data[1])
+		case extensionKeyShare:
+			if length < 2 {
+				return alertDecodeError
+			}
+			m.keyShare.group = CurveID(data[0])<<8 | CurveID(data[1])
+			if length-4 != int(data[2])<<8|int(data[3]) {
+				return alertDecodeError
+			}
+			m.keyShare.data = data[4:length]
+		}
+		data = data[length:]
+	}
+
+	return alertSuccess
+}
+
+type encryptedExtensionsMsg struct {
+	raw          []byte
+	alpnProtocol string
+	earlyData    bool
+}
+
+func (m *encryptedExtensionsMsg) equal(i interface{}) bool {
+	m1, ok := i.(*encryptedExtensionsMsg)
+	if !ok {
+		return false
+	}
+
+	return bytes.Equal(m.raw, m1.raw) &&
+		m.alpnProtocol == m1.alpnProtocol &&
+		m.earlyData == m1.earlyData
+}
+
+func (m *encryptedExtensionsMsg) marshal() []byte {
+	if m.raw != nil {
+		return m.raw
+	}
+
+	length := 2
+
+	if m.earlyData {
+		length += 4
+	}
+	alpnLen := len(m.alpnProtocol)
+	if alpnLen > 0 {
+		if alpnLen >= 256 {
+			panic("invalid ALPN protocol")
+		}
+		length += 2 + 2 + 2 + 1 + alpnLen
+	}
+
+	x := make([]byte, 4+length)
+	x[0] = typeEncryptedExtensions
+	x[1] = uint8(length >> 16)
+	x[2] = uint8(length >> 8)
+	x[3] = uint8(length)
+	length -= 2
+	x[4] = uint8(length >> 8)
+	x[5] = uint8(length)
+
+	z := x[6:]
+	if alpnLen > 0 {
+		z[0] = byte(extensionALPN >> 8)
+		z[1] = byte(extensionALPN)
+		l := 2 + 1 + alpnLen
+		z[2] = byte(l >> 8)
+		z[3] = byte(l)
+		l -= 2
+		z[4] = byte(l >> 8)
+		z[5] = byte(l)
+		l -= 1
+		z[6] = byte(l)
+		copy(z[7:], []byte(m.alpnProtocol))
+		z = z[7+alpnLen:]
+	}
+
+	if m.earlyData {
+		z[0] = byte(extensionEarlyData >> 8)
+		z[1] = byte(extensionEarlyData)
+		z = z[4:]
+	}
+
+	m.raw = x
+	return x
+}
+
+func (m *encryptedExtensionsMsg) unmarshal(data []byte) alert {
+	if len(data) < 6 {
+		return alertDecodeError
+	}
+	m.raw = data
+
+	m.alpnProtocol = ""
+	m.earlyData = false
+
+	extensionsLength := int(data[4])<<8 | int(data[5])
+	data = data[6:]
+	if len(data) != extensionsLength {
+		return alertDecodeError
+	}
+
+	for len(data) != 0 {
+		if len(data) < 4 {
+			return alertDecodeError
+		}
+		extension := uint16(data[0])<<8 | uint16(data[1])
+		length := int(data[2])<<8 | int(data[3])
+		data = data[4:]
+		if len(data) < length {
+			return alertDecodeError
+		}
+
+		switch extension {
+		case extensionALPN:
+			d := data[:length]
+			if len(d) < 3 {
+				return alertDecodeError
+			}
+			l := int(d[0])<<8 | int(d[1])
+			if l != len(d)-2 {
+				return alertDecodeError
+			}
+			d = d[2:]
+			l = int(d[0])
+			if l != len(d)-1 {
+				return alertDecodeError
+			}
+			d = d[1:]
+			if len(d) == 0 {
+				// ALPN protocols must not be empty.
+				return alertDecodeError
+			}
+			m.alpnProtocol = string(d)
+		case extensionEarlyData:
+			// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.8
+			m.earlyData = true
+		}
+
+		data = data[length:]
+	}
+
+	return alertSuccess
 }
 
 type certificateMsg struct {
@@ -884,26 +1339,26 @@ func (m *certificateMsg) marshal() (x []byte) {
 	return
 }
 
-func (m *certificateMsg) unmarshal(data []byte) bool {
+func (m *certificateMsg) unmarshal(data []byte) alert {
 	if len(data) < 7 {
-		return false
+		return alertDecodeError
 	}
 
 	m.raw = data
 	certsLen := uint32(data[4])<<16 | uint32(data[5])<<8 | uint32(data[6])
 	if uint32(len(data)) != certsLen+7 {
-		return false
+		return alertDecodeError
 	}
 
 	numCerts := 0
 	d := data[7:]
 	for certsLen > 0 {
 		if len(d) < 4 {
-			return false
+			return alertDecodeError
 		}
 		certLen := uint32(d[0])<<16 | uint32(d[1])<<8 | uint32(d[2])
 		if uint32(len(d)) < 3+certLen {
-			return false
+			return alertDecodeError
 		}
 		d = d[3+certLen:]
 		certsLen -= 3 + certLen
@@ -918,7 +1373,244 @@ func (m *certificateMsg) unmarshal(data []byte) bool {
 		d = d[3+certLen:]
 	}
 
-	return true
+	return alertSuccess
+}
+
+type certificateEntry struct {
+	data       []byte
+	ocspStaple []byte
+	sctList    [][]byte
+}
+
+type certificateMsg13 struct {
+	raw            []byte
+	requestContext []byte
+	certificates   []certificateEntry
+}
+
+func (m *certificateMsg13) equal(i interface{}) bool {
+	m1, ok := i.(*certificateMsg13)
+	if !ok {
+		return false
+	}
+
+	if len(m.certificates) != len(m1.certificates) {
+		return false
+	}
+	for i, _ := range m.certificates {
+		ok := bytes.Equal(m.certificates[i].data, m1.certificates[i].data)
+		ok = ok && bytes.Equal(m.certificates[i].ocspStaple, m1.certificates[i].ocspStaple)
+		ok = ok && eqByteSlices(m.certificates[i].sctList, m1.certificates[i].sctList)
+		if !ok {
+			return false
+		}
+	}
+
+	return bytes.Equal(m.raw, m1.raw) &&
+		bytes.Equal(m.requestContext, m1.requestContext)
+}
+
+func (m *certificateMsg13) marshal() (x []byte) {
+	if m.raw != nil {
+		return m.raw
+	}
+
+	var i int
+	for _, cert := range m.certificates {
+		i += len(cert.data)
+		if len(cert.ocspStaple) != 0 {
+			i += 8 + len(cert.ocspStaple)
+		}
+		if len(cert.sctList) != 0 {
+			i += 6
+			for _, sct := range cert.sctList {
+				i += 2 + len(sct)
+			}
+		}
+	}
+
+	length := 3 + 3*len(m.certificates) + i
+	length += 2 * len(m.certificates) // extensions
+	length += 1 + len(m.requestContext)
+	x = make([]byte, 4+length)
+	x[0] = typeCertificate
+	x[1] = uint8(length >> 16)
+	x[2] = uint8(length >> 8)
+	x[3] = uint8(length)
+
+	z := x[4:]
+
+	z[0] = byte(len(m.requestContext))
+	copy(z[1:], m.requestContext)
+	z = z[1+len(m.requestContext):]
+
+	certificateOctets := len(z) - 3
+	z[0] = uint8(certificateOctets >> 16)
+	z[1] = uint8(certificateOctets >> 8)
+	z[2] = uint8(certificateOctets)
+
+	z = z[3:]
+	for _, cert := range m.certificates {
+		z[0] = uint8(len(cert.data) >> 16)
+		z[1] = uint8(len(cert.data) >> 8)
+		z[2] = uint8(len(cert.data))
+		copy(z[3:], cert.data)
+		z = z[3+len(cert.data):]
+
+		extLenPos := z[:2]
+		z = z[2:]
+
+		extensionLen := 0
+		if len(cert.ocspStaple) != 0 {
+			stapleLen := 4 + len(cert.ocspStaple)
+			z[0] = uint8(extensionStatusRequest >> 8)
+			z[1] = uint8(extensionStatusRequest)
+			z[2] = uint8(stapleLen >> 8)
+			z[3] = uint8(stapleLen)
+
+			stapleLen -= 4
+			z[4] = statusTypeOCSP
+			z[5] = uint8(stapleLen >> 16)
+			z[6] = uint8(stapleLen >> 8)
+			z[7] = uint8(stapleLen)
+			copy(z[8:], cert.ocspStaple)
+			z = z[8+stapleLen:]
+
+			extensionLen += 8 + stapleLen
+		}
+		if len(cert.sctList) != 0 {
+			z[0] = uint8(extensionSCT >> 8)
+			z[1] = uint8(extensionSCT)
+			sctLenPos := z[2:6]
+			z = z[6:]
+			extensionLen += 6
+
+			sctLen := 2
+			for _, sct := range cert.sctList {
+				z[0] = uint8(len(sct) >> 8)
+				z[1] = uint8(len(sct))
+				copy(z[2:], sct)
+				z = z[2+len(sct):]
+
+				extensionLen += 2 + len(sct)
+				sctLen += 2 + len(sct)
+			}
+			sctLenPos[0] = uint8(sctLen >> 8)
+			sctLenPos[1] = uint8(sctLen)
+			sctLen -= 2
+			sctLenPos[2] = uint8(sctLen >> 8)
+			sctLenPos[3] = uint8(sctLen)
+		}
+		extLenPos[0] = uint8(extensionLen >> 8)
+		extLenPos[1] = uint8(extensionLen)
+	}
+
+	m.raw = x
+	return
+}
+
+func (m *certificateMsg13) unmarshal(data []byte) alert {
+	if len(data) < 5 {
+		return alertDecodeError
+	}
+
+	m.raw = data
+
+	ctxLen := data[4]
+	if len(data) < int(ctxLen)+5+3 {
+		return alertDecodeError
+	}
+	m.requestContext = data[5 : 5+ctxLen]
+
+	d := data[5+ctxLen:]
+	certsLen := uint32(d[0])<<16 | uint32(d[1])<<8 | uint32(d[2])
+	if uint32(len(d)) != certsLen+3 {
+		return alertDecodeError
+	}
+
+	numCerts := 0
+	d = d[3:]
+	for certsLen > 0 {
+		if len(d) < 4 {
+			return alertDecodeError
+		}
+		certLen := uint32(d[0])<<16 | uint32(d[1])<<8 | uint32(d[2])
+		if uint32(len(d)) < 3+certLen {
+			return alertDecodeError
+		}
+		d = d[3+certLen:]
+
+		if len(d) < 2 {
+			return alertDecodeError
+		}
+		extLen := uint16(d[0])<<8 | uint16(d[1])
+		if uint16(len(d)) < 2+extLen {
+			return alertDecodeError
+		}
+		d = d[2+extLen:]
+
+		certsLen -= 3 + certLen + 2 + uint32(extLen)
+		numCerts++
+	}
+
+	m.certificates = make([]certificateEntry, numCerts)
+	d = data[8+ctxLen:]
+	for i := 0; i < numCerts; i++ {
+		certLen := uint32(d[0])<<16 | uint32(d[1])<<8 | uint32(d[2])
+		m.certificates[i].data = d[3 : 3+certLen]
+		d = d[3+certLen:]
+
+		extLen := uint16(d[0])<<8 | uint16(d[1])
+		d = d[2:]
+		for extLen > 0 {
+			if extLen < 4 {
+				return alertDecodeError
+			}
+			typ := uint16(d[0])<<8 | uint16(d[1])
+			bodyLen := uint16(d[2])<<8 | uint16(d[3])
+			if extLen < 4+bodyLen {
+				return alertDecodeError
+			}
+			body := d[4 : 4+bodyLen]
+			d = d[4+bodyLen:]
+			extLen -= 4 + bodyLen
+
+			switch typ {
+			case extensionStatusRequest:
+				if len(body) < 4 || body[0] != 0x01 {
+					return alertDecodeError
+				}
+				ocspLen := int(body[1])<<16 | int(body[2])<<8 | int(body[3])
+				if len(body) != 4+ocspLen {
+					return alertDecodeError
+				}
+				m.certificates[i].ocspStaple = body[4:]
+
+			case extensionSCT:
+				if len(body) < 2 {
+					return alertDecodeError
+				}
+				listLen := int(body[0]<<8) | int(body[1])
+				body = body[2:]
+				if len(body) != listLen {
+					return alertDecodeError
+				}
+				for len(body) > 0 {
+					if len(body) < 2 {
+						return alertDecodeError
+					}
+					sctLen := int(body[0]<<8) | int(body[1])
+					if len(body) < 2+sctLen {
+						return alertDecodeError
+					}
+					m.certificates[i].sctList = append(m.certificates[i].sctList, body[2:2+sctLen])
+					body = body[2+sctLen:]
+				}
+			}
+		}
+	}
+
+	return alertSuccess
 }
 
 type serverKeyExchangeMsg struct {
@@ -952,13 +1644,13 @@ func (m *serverKeyExchangeMsg) marshal() []byte {
 	return x
 }
 
-func (m *serverKeyExchangeMsg) unmarshal(data []byte) bool {
+func (m *serverKeyExchangeMsg) unmarshal(data []byte) alert {
 	m.raw = data
 	if len(data) < 4 {
-		return false
+		return alertDecodeError
 	}
 	m.key = data[4:]
-	return true
+	return alertSuccess
 }
 
 type certificateStatusMsg struct {
@@ -1006,25 +1698,25 @@ func (m *certificateStatusMsg) marshal() []byte {
 	return x
 }
 
-func (m *certificateStatusMsg) unmarshal(data []byte) bool {
+func (m *certificateStatusMsg) unmarshal(data []byte) alert {
 	m.raw = data
 	if len(data) < 5 {
-		return false
+		return alertDecodeError
 	}
 	m.statusType = data[4]
 
 	m.response = nil
 	if m.statusType == statusTypeOCSP {
 		if len(data) < 8 {
-			return false
+			return alertDecodeError
 		}
 		respLen := uint32(data[5])<<16 | uint32(data[6])<<8 | uint32(data[7])
 		if uint32(len(data)) != 4+4+respLen {
-			return false
+			return alertDecodeError
 		}
 		m.response = data[8:]
 	}
-	return true
+	return alertSuccess
 }
 
 type serverHelloDoneMsg struct{}
@@ -1040,8 +1732,11 @@ func (m *serverHelloDoneMsg) marshal() []byte {
 	return x
 }
 
-func (m *serverHelloDoneMsg) unmarshal(data []byte) bool {
-	return len(data) == 4
+func (m *serverHelloDoneMsg) unmarshal(data []byte) alert {
+	if len(data) != 4 {
+		return alertDecodeError
+	}
+	return alertSuccess
 }
 
 type clientKeyExchangeMsg struct {
@@ -1075,17 +1770,17 @@ func (m *clientKeyExchangeMsg) marshal() []byte {
 	return x
 }
 
-func (m *clientKeyExchangeMsg) unmarshal(data []byte) bool {
+func (m *clientKeyExchangeMsg) unmarshal(data []byte) alert {
 	m.raw = data
 	if len(data) < 4 {
-		return false
+		return alertDecodeError
 	}
 	l := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
 	if l != len(data)-4 {
-		return false
+		return alertDecodeError
 	}
 	m.ciphertext = data[4:]
-	return true
+	return alertSuccess
 }
 
 type finishedMsg struct {
@@ -1116,13 +1811,13 @@ func (m *finishedMsg) marshal() (x []byte) {
 	return
 }
 
-func (m *finishedMsg) unmarshal(data []byte) bool {
+func (m *finishedMsg) unmarshal(data []byte) alert {
 	m.raw = data
 	if len(data) < 4 {
-		return false
+		return alertDecodeError
 	}
 	m.verifyData = data[4:]
-	return true
+	return alertSuccess
 }
 
 type nextProtoMsg struct {
@@ -1168,31 +1863,31 @@ func (m *nextProtoMsg) marshal() []byte {
 	return x
 }
 
-func (m *nextProtoMsg) unmarshal(data []byte) bool {
+func (m *nextProtoMsg) unmarshal(data []byte) alert {
 	m.raw = data
 
 	if len(data) < 5 {
-		return false
+		return alertDecodeError
 	}
 	data = data[4:]
 	protoLen := int(data[0])
 	data = data[1:]
 	if len(data) < protoLen {
-		return false
+		return alertDecodeError
 	}
 	m.proto = string(data[0:protoLen])
 	data = data[protoLen:]
 
 	if len(data) < 1 {
-		return false
+		return alertDecodeError
 	}
 	paddingLen := int(data[0])
 	data = data[1:]
 	if len(data) != paddingLen {
-		return false
+		return alertDecodeError
 	}
 
-	return true
+	return alertSuccess
 }
 
 type certificateRequestMsg struct {
@@ -1274,42 +1969,42 @@ func (m *certificateRequestMsg) marshal() (x []byte) {
 	return
 }
 
-func (m *certificateRequestMsg) unmarshal(data []byte) bool {
+func (m *certificateRequestMsg) unmarshal(data []byte) alert {
 	m.raw = data
 
 	if len(data) < 5 {
-		return false
+		return alertDecodeError
 	}
 
 	length := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	if uint32(len(data))-4 != length {
-		return false
+		return alertDecodeError
 	}
 
 	numCertTypes := int(data[4])
 	data = data[5:]
 	if numCertTypes == 0 || len(data) <= numCertTypes {
-		return false
+		return alertDecodeError
 	}
 
 	m.certificateTypes = make([]byte, numCertTypes)
 	if copy(m.certificateTypes, data) != numCertTypes {
-		return false
+		return alertDecodeError
 	}
 
 	data = data[numCertTypes:]
 
 	if m.hasSignatureAndHash {
 		if len(data) < 2 {
-			return false
+			return alertDecodeError
 		}
 		sigAndHashLen := uint16(data[0])<<8 | uint16(data[1])
 		data = data[2:]
 		if sigAndHashLen&1 != 0 {
-			return false
+			return alertDecodeError
 		}
 		if len(data) < int(sigAndHashLen) {
-			return false
+			return alertDecodeError
 		}
 		numSigAlgos := sigAndHashLen / 2
 		m.supportedSignatureAlgorithms = make([]SignatureScheme, numSigAlgos)
@@ -1320,12 +2015,12 @@ func (m *certificateRequestMsg) unmarshal(data []byte) bool {
 	}
 
 	if len(data) < 2 {
-		return false
+		return alertDecodeError
 	}
 	casLength := uint16(data[0])<<8 | uint16(data[1])
 	data = data[2:]
 	if len(data) < int(casLength) {
-		return false
+		return alertDecodeError
 	}
 	cas := make([]byte, casLength)
 	copy(cas, data)
@@ -1334,20 +2029,23 @@ func (m *certificateRequestMsg) unmarshal(data []byte) bool {
 	m.certificateAuthorities = nil
 	for len(cas) > 0 {
 		if len(cas) < 2 {
-			return false
+			return alertDecodeError
 		}
 		caLen := uint16(cas[0])<<8 | uint16(cas[1])
 		cas = cas[2:]
 
 		if len(cas) < int(caLen) {
-			return false
+			return alertDecodeError
 		}
 
 		m.certificateAuthorities = append(m.certificateAuthorities, cas[:caLen])
 		cas = cas[caLen:]
 	}
 
-	return len(data) == 0
+	if len(data) != 0 {
+		return alertDecodeError
+	}
+	return alertSuccess
 }
 
 type certificateVerifyMsg struct {
@@ -1400,16 +2098,16 @@ func (m *certificateVerifyMsg) marshal() (x []byte) {
 	return
 }
 
-func (m *certificateVerifyMsg) unmarshal(data []byte) bool {
+func (m *certificateVerifyMsg) unmarshal(data []byte) alert {
 	m.raw = data
 
 	if len(data) < 6 {
-		return false
+		return alertDecodeError
 	}
 
 	length := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	if uint32(len(data))-4 != length {
-		return false
+		return alertDecodeError
 	}
 
 	data = data[4:]
@@ -1419,17 +2117,17 @@ func (m *certificateVerifyMsg) unmarshal(data []byte) bool {
 	}
 
 	if len(data) < 2 {
-		return false
+		return alertDecodeError
 	}
 	siglength := int(data[0])<<8 + int(data[1])
 	data = data[2:]
 	if len(data) != siglength {
-		return false
+		return alertDecodeError
 	}
 
 	m.signature = data
 
-	return true
+	return alertSuccess
 }
 
 type newSessionTicketMsg struct {
@@ -1469,26 +2167,151 @@ func (m *newSessionTicketMsg) marshal() (x []byte) {
 	return
 }
 
-func (m *newSessionTicketMsg) unmarshal(data []byte) bool {
+func (m *newSessionTicketMsg) unmarshal(data []byte) alert {
 	m.raw = data
 
 	if len(data) < 10 {
-		return false
+		return alertDecodeError
 	}
 
 	length := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
 	if uint32(len(data))-4 != length {
-		return false
+		return alertDecodeError
 	}
 
 	ticketLen := int(data[8])<<8 + int(data[9])
 	if len(data)-10 != ticketLen {
-		return false
+		return alertDecodeError
 	}
 
 	m.ticket = data[10:]
 
-	return true
+	return alertSuccess
+}
+
+type newSessionTicketMsg13 struct {
+	raw                []byte
+	lifetime           uint32
+	ageAdd             uint32
+	ticket             []byte
+	withEarlyDataInfo  bool
+	maxEarlyDataLength uint32
+}
+
+func (m *newSessionTicketMsg13) equal(i interface{}) bool {
+	m1, ok := i.(*newSessionTicketMsg13)
+	if !ok {
+		return false
+	}
+
+	return bytes.Equal(m.raw, m1.raw) &&
+		m.lifetime == m1.lifetime &&
+		m.ageAdd == m1.ageAdd &&
+		bytes.Equal(m.ticket, m1.ticket) &&
+		m.withEarlyDataInfo == m1.withEarlyDataInfo &&
+		m.maxEarlyDataLength == m1.maxEarlyDataLength
+}
+
+func (m *newSessionTicketMsg13) marshal() (x []byte) {
+	if m.raw != nil {
+		return m.raw
+	}
+
+	// See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.6
+	ticketLen := len(m.ticket)
+	length := 12 + ticketLen
+	if m.withEarlyDataInfo {
+		length += 8
+	}
+	x = make([]byte, 4+length)
+	x[0] = typeNewSessionTicket
+	x[1] = uint8(length >> 16)
+	x[2] = uint8(length >> 8)
+	x[3] = uint8(length)
+
+	x[4] = uint8(m.lifetime >> 24)
+	x[5] = uint8(m.lifetime >> 16)
+	x[6] = uint8(m.lifetime >> 8)
+	x[7] = uint8(m.lifetime)
+	x[8] = uint8(m.ageAdd >> 24)
+	x[9] = uint8(m.ageAdd >> 16)
+	x[10] = uint8(m.ageAdd >> 8)
+	x[11] = uint8(m.ageAdd)
+
+	x[12] = uint8(ticketLen >> 8)
+	x[13] = uint8(ticketLen)
+	copy(x[14:], m.ticket)
+
+	if m.withEarlyDataInfo {
+		z := x[14+ticketLen:]
+		z[1] = 8
+		z[2] = uint8(extensionTicketEarlyDataInfo >> 8)
+		z[3] = uint8(extensionTicketEarlyDataInfo)
+		z[5] = 4
+		z[6] = uint8(m.maxEarlyDataLength >> 24)
+		z[7] = uint8(m.maxEarlyDataLength >> 16)
+		z[8] = uint8(m.maxEarlyDataLength >> 8)
+		z[9] = uint8(m.maxEarlyDataLength)
+	}
+
+	m.raw = x
+
+	return
+}
+
+func (m *newSessionTicketMsg13) unmarshal(data []byte) alert {
+	m.raw = data
+	m.maxEarlyDataLength = 0
+	m.withEarlyDataInfo = false
+
+	if len(data) < 16 {
+		return alertDecodeError
+	}
+
+	length := uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
+	if uint32(len(data))-4 != length {
+		return alertDecodeError
+	}
+
+	m.lifetime = uint32(data[4])<<24 | uint32(data[5])<<16 |
+		uint32(data[6])<<8 | uint32(data[7])
+	m.ageAdd = uint32(data[8])<<24 | uint32(data[9])<<16 |
+		uint32(data[10])<<8 | uint32(data[11])
+
+	ticketLen := int(data[12])<<8 + int(data[13])
+	if 14+ticketLen > len(data) {
+		return alertDecodeError
+	}
+	m.ticket = data[14 : 14+ticketLen]
+
+	data = data[14+ticketLen:]
+	extLen := int(data[0])<<8 + int(data[1])
+	if extLen != len(data)-2 {
+		return alertDecodeError
+	}
+
+	data = data[2:]
+	for len(data) > 0 {
+		if len(data) < 4 {
+			return alertDecodeError
+		}
+		extType := uint16(data[0])<<8 + uint16(data[1])
+		length := int(data[2])<<8 + int(data[3])
+		data = data[4:]
+
+		switch extType {
+		case extensionTicketEarlyDataInfo:
+			if length != 4 {
+				return alertDecodeError
+			}
+			m.withEarlyDataInfo = true
+			m.maxEarlyDataLength = uint32(data[0])<<24 | uint32(data[1])<<16 |
+				uint32(data[2])<<8 | uint32(data[3])
+		}
+		data = data[length:]
+	}
+
+	return alertSuccess
 }
 
 type helloRequestMsg struct {
@@ -1498,8 +2321,11 @@ func (*helloRequestMsg) marshal() []byte {
 	return []byte{typeHelloRequest, 0, 0, 0}
 }
 
-func (*helloRequestMsg) unmarshal(data []byte) bool {
-	return len(data) == 4
+func (*helloRequestMsg) unmarshal(data []byte) alert {
+	if len(data) != 4 {
+		return alertDecodeError
+	}
+	return alertSuccess
 }
 
 func eqUint16s(x, y []uint16) bool {
@@ -1556,6 +2382,21 @@ func eqSignatureAlgorithms(x, y []SignatureScheme) bool {
 	}
 	for i, v := range x {
 		if v != y[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func eqKeyShares(x, y []keyShare) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if x[i].group != y[i].group {
+			return false
+		}
+		if !bytes.Equal(x[i].data, y[i].data) {
 			return false
 		}
 	}

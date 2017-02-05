@@ -17,6 +17,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 type clientHandshakeState struct {
@@ -29,38 +30,51 @@ type clientHandshakeState struct {
 	session      *ClientSessionState
 }
 
-func makeClientHello(config *Config) (*clientHelloMsg, error) {
-	if len(config.ServerName) == 0 && !config.InsecureSkipVerify {
-		return nil, errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
+// c.out.Mutex <= L; c.handshakeMutex <= L.
+func (c *Conn) clientHandshake() error {
+	if c.config == nil {
+		c.config = defaultConfig()
+	}
+
+	// This may be a renegotiation handshake, in which case some fields
+	// need to be reset.
+	c.didResume = false
+
+	if len(c.config.ServerName) == 0 && !c.config.InsecureSkipVerify {
+		return errors.New("tls: either ServerName or InsecureSkipVerify must be specified in the tls.Config")
 	}
 
 	nextProtosLength := 0
-	for _, proto := range config.NextProtos {
+	for _, proto := range c.config.NextProtos {
 		if l := len(proto); l == 0 || l > 255 {
-			return nil, errors.New("tls: invalid NextProtos value")
+			return errors.New("tls: invalid NextProtos value")
 		} else {
 			nextProtosLength += 1 + l
 		}
 	}
-
 	if nextProtosLength > 0xffff {
-		return nil, errors.New("tls: NextProtos values too large")
+		return errors.New("tls: NextProtos values too large")
 	}
 
 	hello := &clientHelloMsg{
-		vers:                         config.maxVersion(),
+		vers:                         c.config.maxVersion(),
 		compressionMethods:           []uint8{compressionNone},
 		random:                       make([]byte, 32),
 		ocspStapling:                 true,
 		scts:                         true,
-		serverName:                   hostnameInSNI(config.ServerName),
-		supportedCurves:              config.curvePreferences(),
+		serverName:                   hostnameInSNI(c.config.ServerName),
+		supportedCurves:              c.config.curvePreferences(),
 		supportedPoints:              []uint8{pointFormatUncompressed},
-		nextProtoNeg:                 len(config.NextProtos) > 0,
+		nextProtoNeg:                 len(c.config.NextProtos) > 0,
 		secureRenegotiationSupported: true,
-		alpnProtocols:                config.NextProtos,
+		alpnProtocols:                c.config.NextProtos,
 	}
-	possibleCipherSuites := config.cipherSuites()
+
+	if c.handshakes > 0 {
+		hello.secureRenegotiation = c.clientFinished[:]
+	}
+
+	possibleCipherSuites := c.config.cipherSuites(c.vers)
 	hello.cipherSuites = make([]uint16, 0, len(possibleCipherSuites))
 
 NextCipherSuite:
@@ -79,35 +93,14 @@ NextCipherSuite:
 		}
 	}
 
-	_, err := io.ReadFull(config.rand(), hello.random)
+	_, err := io.ReadFull(c.config.rand(), hello.random)
 	if err != nil {
-		return nil, errors.New("tls: short read from Rand: " + err.Error())
+		c.sendAlert(alertInternalError)
+		return errors.New("tls: short read from Rand: " + err.Error())
 	}
 
 	if hello.vers >= VersionTLS12 {
 		hello.supportedSignatureAlgorithms = supportedSignatureAlgorithms
-	}
-
-	return hello, nil
-}
-
-// c.out.Mutex <= L; c.handshakeMutex <= L.
-func (c *Conn) clientHandshake() error {
-	if c.config == nil {
-		c.config = defaultConfig()
-	}
-
-	// This may be a renegotiation handshake, in which case some fields
-	// need to be reset.
-	c.didResume = false
-
-	hello, err := makeClientHello(c.config)
-	if err != nil {
-		return err
-	}
-
-	if c.handshakes > 0 {
-		hello.secureRenegotiation = c.clientFinished[:]
 	}
 
 	var session *ClientSessionState
@@ -155,36 +148,12 @@ func (c *Conn) clientHandshake() error {
 		// (see RFC 5077).
 		hello.sessionId = make([]byte, 16)
 		if _, err := io.ReadFull(c.config.rand(), hello.sessionId); err != nil {
+			c.sendAlert(alertInternalError)
 			return errors.New("tls: short read from Rand: " + err.Error())
 		}
 	}
 
-	hs := &clientHandshakeState{
-		c:       c,
-		hello:   hello,
-		session: session,
-	}
-
-	if err = hs.handshake(); err != nil {
-		return err
-	}
-
-	// If we had a successful handshake and hs.session is different from
-	// the one already cached - cache a new one
-	if sessionCache != nil && hs.session != nil && session != hs.session {
-		sessionCache.Put(cacheKey, hs.session)
-	}
-
-	return nil
-}
-
-// Does the handshake, either a full one or resumes old session.
-// Requires hs.c, hs.hello, and, optionally, hs.session to be set.
-func (hs *clientHandshakeState) handshake() error {
-	c := hs.c
-
-	// send ClientHello
-	if _, err := c.writeRecord(recordTypeHandshake, hs.hello.marshal()); err != nil {
+	if _, err := c.writeRecord(recordTypeHandshake, hello.marshal()); err != nil {
 		return err
 	}
 
@@ -192,27 +161,40 @@ func (hs *clientHandshakeState) handshake() error {
 	if err != nil {
 		return err
 	}
-
-	var ok bool
-	if hs.serverHello, ok = msg.(*serverHelloMsg); !ok {
+	serverHello, ok := msg.(*serverHelloMsg)
+	if !ok {
 		c.sendAlert(alertUnexpectedMessage)
-		return unexpectedMessageError(hs.serverHello, msg)
+		return unexpectedMessageError(serverHello, msg)
 	}
 
-	if err = hs.pickTLSVersion(); err != nil {
-		return err
+	vers, ok := c.config.mutualVersion(serverHello.vers)
+	if !ok || vers < VersionTLS10 {
+		// TLS 1.0 is the minimum version supported as a client.
+		c.sendAlert(alertProtocolVersion)
+		return fmt.Errorf("tls: server selected unsupported protocol version %x", serverHello.vers)
+	}
+	c.vers = vers
+	c.haveVers = true
+
+	suite := mutualCipherSuite(hello.cipherSuites, serverHello.cipherSuite)
+	if suite == nil {
+		c.sendAlert(alertHandshakeFailure)
+		return errors.New("tls: server chose an unconfigured cipher suite")
 	}
 
-	if err = hs.pickCipherSuite(); err != nil {
-		return err
+	hs := &clientHandshakeState{
+		c:            c,
+		serverHello:  serverHello,
+		hello:        hello,
+		suite:        suite,
+		finishedHash: newFinishedHash(c.vers, suite),
+		session:      session,
 	}
 
 	isResume, err := hs.processServerHello()
 	if err != nil {
 		return err
 	}
-
-	hs.finishedHash = newFinishedHash(c.vers, hs.suite)
 
 	// No signatures of the handshake are needed in a resumption.
 	// Otherwise, in a full handshake, if we don't have any certificates
@@ -265,33 +247,15 @@ func (hs *clientHandshakeState) handshake() error {
 		}
 	}
 
+	if sessionCache != nil && hs.session != nil && session != hs.session {
+		sessionCache.Put(cacheKey, hs.session)
+	}
+
 	c.didResume = isResume
+	c.phase = handshakeConfirmed
+	atomic.StoreInt32(&c.handshakeConfirmed, 1)
 	c.handshakeComplete = true
-
-	return nil
-}
-
-func (hs *clientHandshakeState) pickTLSVersion() error {
-	vers, ok := hs.c.config.mutualVersion(hs.serverHello.vers)
-	if !ok || vers < VersionTLS10 {
-		// TLS 1.0 is the minimum version supported as a client.
-		hs.c.sendAlert(alertProtocolVersion)
-		return fmt.Errorf("tls: server selected unsupported protocol version %x", hs.serverHello.vers)
-	}
-
-	hs.c.vers = vers
-	hs.c.haveVers = true
-
-	return nil
-}
-
-func (hs *clientHandshakeState) pickCipherSuite() error {
-	if hs.suite = mutualCipherSuite(hs.hello.cipherSuites, hs.serverHello.cipherSuite); hs.suite == nil {
-		hs.c.sendAlert(alertHandshakeFailure)
-		return errors.New("tls: server chose an unconfigured cipher suite")
-	}
-
-	hs.c.cipherSuite = hs.suite.id
+	c.cipherSuite = suite.id
 	return nil
 }
 
@@ -641,7 +605,7 @@ func (hs *clientHandshakeState) readFinished(out []byte) error {
 	verify := hs.finishedHash.serverSum(hs.masterSecret)
 	if len(verify) != len(serverFinished.verifyData) ||
 		subtle.ConstantTimeCompare(verify, serverFinished.verifyData) != 1 {
-		c.sendAlert(alertHandshakeFailure)
+		c.sendAlert(alertDecryptError)
 		return errors.New("tls: server's Finished message was incorrect")
 	}
 	hs.finishedHash.Write(serverFinished.marshal())
@@ -840,7 +804,7 @@ func mutualProtocol(protos, preferenceProtos []string) (string, bool) {
 	return protos[0], true
 }
 
-// hostnameInSNI converts name into an approriate hostname for SNI.
+// hostnameInSNI converts name into an appropriate hostname for SNI.
 // Literal IP addresses and absolute FQDNs are not permitted as SNI values.
 // See https://tools.ietf.org/html/rfc6066#section-3.
 func hostnameInSNI(name string) string {

@@ -22,10 +22,12 @@ import (
 )
 
 const (
-	VersionSSL30 = 0x0300
-	VersionTLS10 = 0x0301
-	VersionTLS11 = 0x0302
-	VersionTLS12 = 0x0303
+	VersionSSL30        = 0x0300
+	VersionTLS10        = 0x0301
+	VersionTLS11        = 0x0302
+	VersionTLS12        = 0x0303
+	VersionTLS13        = 0x0304
+	VersionTLS13Draft18 = 0x7f00 | 18
 )
 
 const (
@@ -50,19 +52,20 @@ const (
 
 // TLS handshake message types.
 const (
-	typeHelloRequest       uint8 = 0
-	typeClientHello        uint8 = 1
-	typeServerHello        uint8 = 2
-	typeNewSessionTicket   uint8 = 4
-	typeCertificate        uint8 = 11
-	typeServerKeyExchange  uint8 = 12
-	typeCertificateRequest uint8 = 13
-	typeServerHelloDone    uint8 = 14
-	typeCertificateVerify  uint8 = 15
-	typeClientKeyExchange  uint8 = 16
-	typeFinished           uint8 = 20
-	typeCertificateStatus  uint8 = 22
-	typeNextProtocol       uint8 = 67 // Not IANA assigned
+	typeHelloRequest        uint8 = 0
+	typeClientHello         uint8 = 1
+	typeServerHello         uint8 = 2
+	typeNewSessionTicket    uint8 = 4
+	typeEncryptedExtensions uint8 = 8
+	typeCertificate         uint8 = 11
+	typeServerKeyExchange   uint8 = 12
+	typeCertificateRequest  uint8 = 13
+	typeServerHelloDone     uint8 = 14
+	typeCertificateVerify   uint8 = 15
+	typeClientKeyExchange   uint8 = 16
+	typeFinished            uint8 = 20
+	typeCertificateStatus   uint8 = 22
+	typeNextProtocol        uint8 = 67 // Not IANA assigned
 )
 
 // TLS compression types.
@@ -74,12 +77,18 @@ const (
 const (
 	extensionServerName          uint16 = 0
 	extensionStatusRequest       uint16 = 5
-	extensionSupportedCurves     uint16 = 10
+	extensionSupportedCurves     uint16 = 10 // Supported Groups in 1.3 nomenclature
 	extensionSupportedPoints     uint16 = 11
 	extensionSignatureAlgorithms uint16 = 13
 	extensionALPN                uint16 = 16
 	extensionSCT                 uint16 = 18 // https://tools.ietf.org/html/rfc6962#section-6
 	extensionSessionTicket       uint16 = 35
+	extensionKeyShare            uint16 = 40
+	extensionPreSharedKey        uint16 = 41
+	extensionEarlyData           uint16 = 42
+	extensionSupportedVersions   uint16 = 43
+	extensionPSKKeyExchangeModes uint16 = 45
+	extensionTicketEarlyDataInfo uint16 = 46
 	extensionNextProtoNeg        uint16 = 13172 // not IANA assigned
 	extensionRenegotiationInfo   uint16 = 0xff01
 )
@@ -89,8 +98,17 @@ const (
 	scsvRenegotiation uint16 = 0x00ff
 )
 
+// PSK Key Exchange Modes
+// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.7
+const (
+	pskDHEKeyExchange uint8 = 1
+)
+
 // CurveID is the type of a TLS identifier for an elliptic curve. See
 // http://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-8
+//
+// TLS 1.3 refers to these as Groups, but this library implements only
+// curve-based ones anyway. See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.4.
 type CurveID uint16
 
 const (
@@ -99,6 +117,22 @@ const (
 	CurveP521 CurveID = 25
 	X25519    CurveID = 29
 )
+
+// TLS 1.3 Key Share
+// See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.5
+type keyShare struct {
+	group CurveID
+	data  []byte
+}
+
+// TLS 1.3 PSK Identity and Binder, as sent by the client
+// https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-4.2.6
+
+type psk struct {
+	identity     []byte
+	obfTicketAge uint32
+	binder       []byte
+}
 
 // TLS Elliptic Curve Point Formats
 // http://www.iana.org/assignments/tls-parameters/tls-parameters.xml#tls-parameters-9
@@ -147,6 +181,7 @@ var supportedSignatureAlgorithms = []SignatureScheme{
 
 // ConnectionState records basic TLS details about the connection.
 type ConnectionState struct {
+	ConnectionID                []byte                // Random unique connection id
 	Version                     uint16                // TLS version used by the connection (e.g. VersionTLS12)
 	HandshakeComplete           bool                  // TLS handshake is complete
 	DidResume                   bool                  // connection resumes a previous TLS connection
@@ -166,6 +201,17 @@ type ConnectionState struct {
 	// change in future versions of Go once the TLS master-secret fix has
 	// been standardized and implemented.
 	TLSUnique []byte
+
+	// HandshakeConfirmed is true once all data returned by Read
+	// (past and future) is guaranteed not to be replayed.
+	HandshakeConfirmed bool
+
+	// Unique0RTTToken is a value that never repeats, and can be used
+	// to detect replay attacks against 0-RTT connections.
+	// Unique0RTTToken is only present if HandshakeConfirmed is false.
+	Unique0RTTToken []byte
+
+	ClientHello []byte // ClientHello packet
 }
 
 // ClientAuthType declares the policy the server will follow for
@@ -281,6 +327,18 @@ type ClientHelloInfo struct {
 	// from, or write to, this connection; that will cause the TLS
 	// connection to fail.
 	Conn net.Conn
+
+	// Offered0RTTData is true if the client announced that it will send
+	// 0-RTT data. If the server Config.Accept0RTTData is true, and the
+	// client offered a session ticket valid for that purpose, it will
+	// be notified that the 0-RTT data is accepted and it will be made
+	// immediately available for Read.
+	Offered0RTTData bool
+
+	// The Fingerprint is an sequence of bytes unique to this Client Hello.
+	// It can be used to prevent or mitigate 0-RTT data replays as it's
+	// guaranteed that a replayed connection will have the same Fingerprint.
+	Fingerprint []byte
 }
 
 // CertificateRequestInfo contains information from a server's
@@ -442,9 +500,14 @@ type Config struct {
 	// This should be used only for testing.
 	InsecureSkipVerify bool
 
-	// CipherSuites is a list of supported cipher suites. If CipherSuites
-	// is nil, TLS uses a list of suites supported by the implementation.
+	// CipherSuites is a list of supported cipher suites to be used in
+	// TLS 1.0-1.2. If CipherSuites is nil, TLS uses a list of suites
+	// supported by the implementation.
 	CipherSuites []uint16
+
+	// TLS13CipherSuites is a list of supported cipher suites to be used in
+	// TLS 1.3. If nil, uses a list of suites supported by the implementation.
+	TLS13CipherSuites []uint16
 
 	// PreferServerCipherSuites controls whether the server selects the
 	// client's most preferred ciphersuite, or the server's most preferred
@@ -466,8 +529,8 @@ type Config struct {
 	// connections using that key are compromised.
 	SessionTicketKey [32]byte
 
-	// ClientSessionCache is a cache of ClientSessionState entries for TLS
-	// session resumption.
+	// SessionCache is a cache of ClientSessionState entries for TLS session
+	// resumption.
 	ClientSessionCache ClientSessionCache
 
 	// MinVersion contains the minimum SSL/TLS version that is acceptable.
@@ -501,6 +564,32 @@ type Config struct {
 	// Use of KeyLogWriter compromises security and should only be
 	// used for debugging.
 	KeyLogWriter io.Writer
+
+	// If Max0RTTDataSize is not zero, the client will be allowed to use
+	// session tickets to send at most this number of bytes of 0-RTT data.
+	// 0-RTT data is subject to replay and has memory DoS implications.
+	// The server will later be able to refuse the 0-RTT data with
+	// Accept0RTTData, or wait for the client to prove that it's not
+	// replayed with Conn.ConfirmHandshake.
+	//
+	// It has no meaning on the client.
+	//
+	// See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-2.3.
+	Max0RTTDataSize uint32
+
+	// Accept0RTTData makes the 0-RTT data received from the client
+	// immediately available to Read. 0-RTT data is subject to replay.
+	// Use Conn.ConfirmHandshake to wait until the data is known not
+	// to be replayed after reading it.
+	//
+	// It has no meaning on the client.
+	//
+	// See https://tools.ietf.org/html/draft-ietf-tls-tls13-18#section-2.3.
+	Accept0RTTData bool
+
+	// SessionTicketSealer, if not nil, is used to wrap and unwrap
+	// session tickets, instead of SessionTicketKey.
+	SessionTicketSealer SessionTicketSealer
 
 	serverInitOnce sync.Once // guards calling (*Config).serverInit
 
@@ -565,6 +654,7 @@ func (c *Config) Clone() *Config {
 		ClientCAs:                   c.ClientCAs,
 		InsecureSkipVerify:          c.InsecureSkipVerify,
 		CipherSuites:                c.CipherSuites,
+		TLS13CipherSuites:           c.TLS13CipherSuites,
 		PreferServerCipherSuites:    c.PreferServerCipherSuites,
 		SessionTicketsDisabled:      c.SessionTicketsDisabled,
 		SessionTicketKey:            c.SessionTicketKey,
@@ -575,6 +665,9 @@ func (c *Config) Clone() *Config {
 		DynamicRecordSizingDisabled: c.DynamicRecordSizingDisabled,
 		Renegotiation:               c.Renegotiation,
 		KeyLogWriter:                c.KeyLogWriter,
+		Accept0RTTData:              c.Accept0RTTData,
+		Max0RTTDataSize:             c.Max0RTTDataSize,
+		SessionTicketSealer:         c.SessionTicketSealer,
 		sessionTicketKeys:           sessionTicketKeys,
 	}
 }
@@ -583,7 +676,7 @@ func (c *Config) Clone() *Config {
 // returned by a GetConfigForClient callback then the argument should be the
 // Config that was passed to Server, otherwise it should be nil.
 func (c *Config) serverInit(originalConfig *Config) {
-	if c.SessionTicketsDisabled || len(c.ticketKeys()) != 0 {
+	if c.SessionTicketsDisabled || len(c.ticketKeys()) != 0 || c.SessionTicketSealer != nil {
 		return
 	}
 
@@ -658,7 +751,14 @@ func (c *Config) time() time.Time {
 	return t()
 }
 
-func (c *Config) cipherSuites() []uint16 {
+func (c *Config) cipherSuites(version uint16) []uint16 {
+	if version >= VersionTLS13 {
+		s := c.TLS13CipherSuites
+		if s == nil {
+			s = defaultTLS13CipherSuites()
+		}
+		return s
+	}
 	s := c.CipherSuites
 	if s == nil {
 		s = defaultCipherSuites()
@@ -690,10 +790,15 @@ func (c *Config) curvePreferences() []CurveID {
 }
 
 // mutualVersion returns the protocol version to use given the advertised
-// version of the peer.
+// version of the peer using the legacy non-extension methods.
 func (c *Config) mutualVersion(vers uint16) (uint16, bool) {
 	minVersion := c.minVersion()
 	maxVersion := c.maxVersion()
+
+	// Version 1.3 and higher are not negotiated via this mechanism.
+	if maxVersion > VersionTLS12 {
+		maxVersion = VersionTLS12
+	}
 
 	if vers < minVersion {
 		return 0, false
@@ -702,6 +807,33 @@ func (c *Config) mutualVersion(vers uint16) (uint16, bool) {
 		vers = maxVersion
 	}
 	return vers, true
+}
+
+// pickVersion returns the protocol version to use given the advertised
+// versions of the peer using the Supported Versions extension.
+func (c *Config) pickVersion(supportedVersions []uint16) (uint16, bool) {
+	minVersion := c.minVersion()
+	maxVersion := c.maxVersion()
+	if c == nil || c.MaxVersion == 0 {
+		maxVersion = VersionTLS13 // override the default if pickVersion is used
+	}
+
+	tls13Enabled := maxVersion >= VersionTLS13
+	if maxVersion > VersionTLS12 {
+		maxVersion = VersionTLS12
+	}
+
+	var vers uint16
+	for _, v := range supportedVersions {
+		if v >= minVersion && v <= maxVersion ||
+			(tls13Enabled && v == VersionTLS13Draft18) {
+			if v > vers {
+				vers = v
+			}
+		}
+	}
+
+	return vers, vers != 0
 }
 
 // getCertificate returns the best certificate for the given ClientHelloInfo,
@@ -812,7 +944,7 @@ type Certificate struct {
 
 type handshakeMessage interface {
 	marshal() []byte
-	unmarshal([]byte) bool
+	unmarshal([]byte) alert
 }
 
 // lruSessionCache is a ClientSessionCache implementation that uses an LRU
@@ -900,8 +1032,9 @@ func defaultConfig() *Config {
 }
 
 var (
-	once                   sync.Once
-	varDefaultCipherSuites []uint16
+	once                        sync.Once
+	varDefaultCipherSuites      []uint16
+	varDefaultTLS13CipherSuites []uint16
 )
 
 func defaultCipherSuites() []uint16 {
@@ -909,11 +1042,21 @@ func defaultCipherSuites() []uint16 {
 	return varDefaultCipherSuites
 }
 
+func defaultTLS13CipherSuites() []uint16 {
+	once.Do(initDefaultCipherSuites)
+	return varDefaultTLS13CipherSuites
+}
+
 func initDefaultCipherSuites() {
-	var topCipherSuites []uint16
+	var topCipherSuites, topTLS13CipherSuites []uint16
 	if cipherhw.AESGCMSupport() {
 		// If AES-GCM hardware is provided then prioritise AES-GCM
 		// cipher suites.
+		topTLS13CipherSuites = []uint16{
+			TLS_AES_128_GCM_SHA256,
+			TLS_AES_256_GCM_SHA384,
+			TLS_CHACHA20_POLY1305_SHA256,
+		}
 		topCipherSuites = []uint16{
 			TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -925,6 +1068,11 @@ func initDefaultCipherSuites() {
 	} else {
 		// Without AES-GCM hardware, we put the ChaCha20-Poly1305
 		// cipher suites first.
+		topTLS13CipherSuites = []uint16{
+			TLS_CHACHA20_POLY1305_SHA256,
+			TLS_AES_128_GCM_SHA256,
+			TLS_AES_256_GCM_SHA384,
+		}
 		topCipherSuites = []uint16{
 			TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
 			TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
@@ -935,6 +1083,10 @@ func initDefaultCipherSuites() {
 		}
 	}
 
+	varDefaultTLS13CipherSuites = make([]uint16, 0, len(cipherSuites))
+	for _, topCipher := range topTLS13CipherSuites {
+		varDefaultTLS13CipherSuites = append(varDefaultTLS13CipherSuites, topCipher)
+	}
 	varDefaultCipherSuites = make([]uint16, 0, len(cipherSuites))
 	varDefaultCipherSuites = append(varDefaultCipherSuites, topCipherSuites...)
 
@@ -943,12 +1095,21 @@ NextCipherSuite:
 		if suite.flags&suiteDefaultOff != 0 {
 			continue
 		}
-		for _, existing := range varDefaultCipherSuites {
-			if existing == suite.id {
-				continue NextCipherSuite
+		if suite.flags&suiteTLS13 != 0 {
+			for _, existing := range varDefaultTLS13CipherSuites {
+				if existing == suite.id {
+					continue NextCipherSuite
+				}
 			}
+			varDefaultTLS13CipherSuites = append(varDefaultTLS13CipherSuites, suite.id)
+		} else {
+			for _, existing := range varDefaultCipherSuites {
+				if existing == suite.id {
+					continue NextCipherSuite
+				}
+			}
+			varDefaultCipherSuites = append(varDefaultCipherSuites, suite.id)
 		}
-		varDefaultCipherSuites = append(varDefaultCipherSuites, suite.id)
 	}
 }
 
