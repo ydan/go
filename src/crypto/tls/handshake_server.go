@@ -822,6 +822,7 @@ func (hs *serverHandshakeState) clientHelloInfo() *ClientHelloInfo {
 	}
 
 	hs.cachedClientHelloInfo = &ClientHelloInfo{
+		Raw:               hs.clientHello.raw,
 		CipherSuites:      hs.clientHello.cipherSuites,
 		ServerName:        hs.clientHello.serverName,
 		SupportedCurves:   hs.clientHello.supportedCurves,
